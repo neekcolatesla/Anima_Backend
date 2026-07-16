@@ -1,0 +1,72 @@
+services:
+  # ---------------------------------------------------------------------------
+  # Microsoft SQL Server - relational database for Anima
+  # ---------------------------------------------------------------------------
+  db:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: anima_sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      # SA password is pulled from the local .env file (MSSQL_SA_PASSWORD)
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+    volumes:
+      # Persist database files across container restarts
+      - mssql_data:/var/opt/mssql
+    healthcheck:
+      # API waits until SQL Server is actually accepting connections
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -C -Q \"SELECT 1\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - anima_net
+
+  # ---------------------------------------------------------------------------
+  # FastAPI backend - orchestration layer + ML pipeline entrypoint
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: anima_api
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        # Start the API only once SQL Server reports healthy
+        condition: service_healthy
+    environment:
+      # Database credentials + connection details (from .env)
+      DB_HOST: db
+      DB_PORT: "1433"
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      # Symmetric key used by cryptography.fernet for field-level encryption
+      FERNET_KEY: ${FERNET_KEY}
+    volumes:
+      # Live-mount source for development
+      - ./app:/app
+      # Named volume for processed 2D MRI JPEG slices
+      - mri_images:/app/static/mri_images
+    networks:
+      - anima_net
+
+# -----------------------------------------------------------------------------
+# Named volumes
+# -----------------------------------------------------------------------------
+volumes:
+  mssql_data:
+  mri_images:
+
+# -----------------------------------------------------------------------------
+# Private bridge network so services resolve each other by name (db, api)
+# -----------------------------------------------------------------------------
+networks:
+  anima_net:
+    driver: bridge
