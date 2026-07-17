@@ -179,7 +179,8 @@ BEGIN
         med_status           INT           NULL,
         nlp_risk_score       DECIMAL(5,2)  NULL,
         final_combined_score DECIMAL(5,2)  NULL,
-        raw_answers          NVARCHAR(MAX) NULL,   -- JSON payload
+        raw_answers          NVARCHAR(MAX) NULL,   -- questionnaire JSON payload
+        clinician_notes      NVARCHAR(MAX) NULL,   -- free-text NLP narrative (self/guardian/clinician)
         CONSTRAINT FK_DSM5_Patient
             FOREIGN KEY (patient_ID) REFERENCES dbo.Patient(patient_ID),
         CONSTRAINT CK_DSM5_raw_answers_json

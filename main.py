@@ -6,8 +6,9 @@ directory that serves processed 2D MRI slices, establishes the initial SQL
 Server connection (via pyodbc) on startup, and wires in the feature routers:
 
     Auth_RBAC       -> /api/auth       (register, login, verify-otp) + /api/patients
-    CSV_Ingestion   -> /api/ingest/csv
+    CSV_Ingestion   -> /api/ingest/csv, /api/ingest/dsm5-csv
     MRI_Ingestion   -> /api/ingest/mri
+    DSM5_Assessment -> /api/dsm5       (questionnaire submit + clinician notes)
     DSM5_Analysis   -> /api/analysis   (placeholder - text & demographic model)
     MRI_Analysis    -> /api/analysis   (placeholder - image classification model)
 """
@@ -27,6 +28,7 @@ from database import get_db, wait_for_db, DB_NAME
 from Auth_RBAC import auth_router, patients_router
 from CSV_Ingestion import router as csv_ingestion_router
 from MRI_Ingestion import router as mri_ingestion_router
+from DSM5_Assessment import router as dsm5_assessment_router
 from DSM5_Analysis import router as dsm5_analysis_router
 from MRI_Analysis import router as mri_analysis_router
 
@@ -107,5 +109,6 @@ app.include_router(auth_router)
 app.include_router(patients_router)
 app.include_router(csv_ingestion_router)
 app.include_router(mri_ingestion_router)
+app.include_router(dsm5_assessment_router)
 app.include_router(dsm5_analysis_router)
 app.include_router(mri_analysis_router)
