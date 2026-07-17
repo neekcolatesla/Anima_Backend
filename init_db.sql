@@ -196,12 +196,16 @@ BEGIN
     CREATE TABLE dbo.MRI (
         MRI_ID          INT           IDENTITY(1,1) NOT NULL PRIMARY KEY,
         patient_ID      VARCHAR(15)   NOT NULL,
-        file_path       VARCHAR(500)  NOT NULL,
+        scan_type       VARCHAR(10)   NOT NULL
+            CONSTRAINT CK_MRI_scan_type CHECK (scan_type IN ('anat', 'anat_gm')),
+        file_path       VARCHAR(500)  NOT NULL,   -- directory of the slice stack
+        slice_count     INT           NULL,       -- number of JPEG slices in folder
         qc_anatomical_1 VARCHAR(10)   NULL,
         qc_anatomical_2 VARCHAR(10)   NULL,
         mri_risk_score  DECIMAL(5,2)  NULL,
         CONSTRAINT FK_MRI_Patient
-            FOREIGN KEY (patient_ID) REFERENCES dbo.Patient(patient_ID)
+            FOREIGN KEY (patient_ID) REFERENCES dbo.Patient(patient_ID),
+        CONSTRAINT UQ_MRI_patient_scan UNIQUE (patient_ID, scan_type)
     );
 END
 GO
