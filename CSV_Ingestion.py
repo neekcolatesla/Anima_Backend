@@ -8,6 +8,7 @@ patient_ID. (SysArchitecture: "api/ingest - Data Pipelines".)
 """
 
 import io
+import json
 import math
 import logging
 from typing import Optional
@@ -19,10 +20,14 @@ import pandas as pd
 
 from database import get_db
 from security import encrypt_value
+from DSM5_Assessment import latest_assessment_id, patient_exists
 
 logger = logging.getLogger("anima.ingest.csv")
 
 router = APIRouter(prefix="/api/ingest", tags=["Ingestion"])
+
+# Columns expected in a DSM-5 bulk CSV (as produced by generate_dsm5_dataset.py).
+DSM5_CSV_COLUMNS = {"patient_ID", "raw_answers_json", "clinician_notes"}
 
 # CSV (NYU Athena Phenotypic) column  ->  DSM5_Assessment column
 CSV_TO_DSM5 = {
@@ -176,5 +181,102 @@ async def ingest_csv(file: UploadFile = File(...),
         "message": f"Ingested {ingested} patient record(s).",
         "ingested_count": ingested,
         "skipped_existing": skipped_existing,
+        "total_rows": int(len(df)),
+    }
+
+
+@router.post("/dsm5-csv")
+async def ingest_dsm5_csv(file: UploadFile = File(...),
+                          conn: pyodbc.Connection = Depends(get_db)) -> dict:
+    """Bulk-ingest a DSM-5 CSV (patient_ID, raw_answers_json, clinician_notes).
+
+    Matches the file produced by generate_dsm5_dataset.py. For each row the
+    patient's latest DSM5_Assessment is enriched with the questionnaire JSON and
+    narrative (or a new row is inserted if the patient has none). Rows whose
+    patient does not exist, or whose raw_answers_json is not valid JSON, are
+    skipped and reported. Runs as a single transaction.
+    """
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    try:
+        df = pd.read_csv(io.BytesIO(raw), dtype=str, keep_default_na=False)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not parse CSV: {exc}")
+
+    missing = DSM5_CSV_COLUMNS - set(df.columns)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"DSM-5 CSV is missing required column(s): {sorted(missing)}",
+        )
+
+    updated = inserted = 0
+    skipped_missing_patient = 0
+    skipped_bad_json = 0
+    try:
+        cursor = conn.cursor()
+        for _, row in df.iterrows():
+            patient_id = str(row["patient_ID"]).strip()
+            if not patient_id:
+                continue
+
+            # FK integrity: the patient must exist before attaching an assessment.
+            if not patient_exists(cursor, patient_id):
+                skipped_missing_patient += 1
+                continue
+
+            raw_json = str(row["raw_answers_json"]).strip() or None
+            if raw_json is not None:
+                try:
+                    json.loads(raw_json)  # validate before the DB ISJSON CHECK
+                except (ValueError, TypeError):
+                    skipped_bad_json += 1
+                    continue
+
+            notes = str(row["clinician_notes"]).strip() or None
+
+            # Enrich the patient's latest assessment, or insert one if none.
+            aid = latest_assessment_id(cursor, patient_id)
+            if aid is not None:
+                cursor.execute(
+                    """
+                    UPDATE dbo.DSM5_Assessment
+                    SET raw_answers = ?, clinician_notes = ?
+                    WHERE assessment_ID = ?;
+                    """,
+                    raw_json, notes, aid,
+                )
+                updated += 1
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO dbo.DSM5_Assessment (patient_ID, raw_answers, clinician_notes)
+                    VALUES (?, ?, ?);
+                    """,
+                    patient_id, raw_json, notes,
+                )
+                inserted += 1
+
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except pyodbc.Error as exc:
+        conn.rollback()
+        logger.exception("DSM-5 CSV ingestion DB error.")
+        raise HTTPException(status_code=400, detail=f"DSM-5 ingestion failed: {exc}")
+    except Exception:
+        conn.rollback()
+        logger.exception("Unexpected DSM-5 CSV ingestion error.")
+        raise HTTPException(status_code=500, detail="Internal DSM-5 ingestion error.")
+
+    return {
+        "status": "success",
+        "message": (f"DSM-5 data applied: {updated} updated, {inserted} inserted."),
+        "updated_count": updated,
+        "inserted_count": inserted,
+        "skipped_missing_patient": skipped_missing_patient,
+        "skipped_invalid_json": skipped_bad_json,
         "total_rows": int(len(df)),
     }
