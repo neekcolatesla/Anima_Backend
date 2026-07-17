@@ -13,7 +13,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, Any, Union
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, APIRouter, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
@@ -248,8 +248,14 @@ def _email_exists(cursor: pyodbc.Cursor, email: str) -> bool:
     return cursor.fetchone() is not None
 
 
-# --- Endpoints ---------------------------------------------------------------
-@app.post("/auth/register")
+# --- Router ------------------------------------------------------------------
+# Maps to the "FastAPI Router" layer in the system architecture. Auth routes are
+# grouped under /api/auth ("api/auth - RBAC Authentication"), alongside the
+# future /api/ingest and /api/analysis routers.
+auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+
+
+@auth_router.post("/register")
 def register(payload: RegisterRequest, conn: pyodbc.Connection = Depends(get_db)) -> dict:
     """Register a Patient, Guardian, or (for @kingston.ac.uk emails) a Clinician.
 
@@ -391,7 +397,7 @@ def _handle_guardian_child(cursor: pyodbc.Cursor, guardian_id: str,
     return None
 
 
-@app.post("/auth/login")
+@auth_router.post("/login")
 def login(payload: LoginRequest, conn: pyodbc.Connection = Depends(get_db)) -> dict:
     """Verify email + password (bcrypt), then issue a fresh login OTP."""
     cursor = conn.cursor()
@@ -419,7 +425,7 @@ def login(payload: LoginRequest, conn: pyodbc.Connection = Depends(get_db)) -> d
     return {"user_ID": user_id, "generated_otp": otp}
 
 
-@app.post("/auth/verify-otp")
+@auth_router.post("/verify-otp")
 def verify_otp(payload: VerifyOtpRequest,
                conn: pyodbc.Connection = Depends(get_db)) -> dict:
     """Validate a user's OTP and confirm it has not expired."""
@@ -450,3 +456,7 @@ def verify_otp(payload: VerifyOtpRequest,
         raise HTTPException(status_code=500, detail=f"Verification failed: {exc}")
 
     return {"user_ID": user_id, "verified": True}
+
+
+# --- Wire the routers into the application (main.py = application entry) ------
+app.include_router(auth_router)
