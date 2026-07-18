@@ -1,0 +1,17 @@
+# Environments
+.venv/
+venv/
+
+# Secrets and Config
+.env
+
+# Data files (seed CSVs live in data/, held-out sets stay off the repo)
+*.csv
+data/*.csv
+
+# Processed MRI output (generated into the Docker volume)
+app/static/mri_images/
+
+# Python cache
+__pycache__/
+*.pyc
