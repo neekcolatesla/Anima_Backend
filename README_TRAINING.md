@@ -58,6 +58,7 @@ evaluated run.
 | 7 | Prints **accuracy + F1** after each fold. |
 | 8 | Tracks the fold with the highest F1. |
 | 9 | Saves that winning fold's weights to `app/models/dsm5_head.pt`. |
+| + | Runs an **ablation** (on by default): the same folds, retrained on feature subsets, to show where the signal comes from. |
 
 ### The label
 
@@ -121,6 +122,41 @@ Saved winning model weights -> ...\app\models\dsm5_head.pt
 
 ---
 
+## 4a. Ablation: reading the results honestly
+
+On this dataset a near-perfect ADHD-vs-control score is **expected, and not a
+sign of a clever model** — it reflects two forms of label leakage:
+
+- The Conners T-scores (`inattentive_score`, `hyperactive_score`) are part of the
+  feature vector, but in ADHD-200 the DX label is *derived from* those very
+  instruments. Those two numbers alone give ~92-93% CV accuracy.
+- The clinical notes were **synthetically generated from the diagnostic scores**
+  (`scripts/generate_dsm5_dataset.py`), so their Bio_ClinicalBERT embedding also
+  encodes the label.
+
+Perfect accuracy here is measured on *held-out* folds, so it is leakage, not
+classic overfitting (overfitting would show high train / low test). The trainer
+therefore runs an ablation by default — the same folds retrained on:
+
+    full (scores + demographics + notes)
+    scores + demographics only
+    clinical notes only (BERT)
+
+and prints a comparison table. Interpret it like this:
+
+- **notes-only ≈ full** → the synthetic notes are leaking the label (the text
+  isn't adding independent clinical insight, it's echoing the diagnosis).
+- **full ≤ scores-only** → the text adds no signal beyond the instrument scores.
+
+This is the honest framing for the write-up: the pipeline is demonstrated
+end-to-end, the clinical scores are legitimately (if circularly) predictive, and
+the text model's apparent performance is bounded by the fact that the notes are
+label-derived. Independently-written clinical notes would be needed to evaluate
+the NLP component's true predictive value. Disable the ablation with
+`--no-ablation` if you only want the shipped model.
+
+---
+
 ## 5. How it plugs into the API
 
 The winning weights are saved to `app/models/dsm5_head.pt` — the exact path
@@ -147,6 +183,28 @@ python train_dsm5.py --output ..\dsm5_head.pt      # save somewhere else
 `--weight-decay` is the main overfitting control — higher values pull the linear
 head toward a simpler solution. `--epochs` and `--lr` tune the full-batch Adam
 loop.
+
+### Fusion experiment (why the notes can hurt)
+
+The full feature vector is 5 strong structured features + a 768-d note embedding.
+On ~130 samples those 768 dimensions can *swamp* the 5, so naive concatenation
+may score **below** the scores-only baseline. Two mitigations are built in:
+
+- `--weight-decay 0.1` (or higher) — shrinks the many noisy note weights.
+- `--note-pca 16` — projects the 768-d embedding to 16 PCA dims (fitted per fold,
+  baked into the model, so the API still feeds raw 773-d vectors) before fusion.
+
+Run the whole comparison at once and let it pick + save the best full config:
+
+```powershell
+python train_dsm5.py --experiment
+```
+
+This sweeps weight decay (0.01 → 1.0) and note-PCA (8/16/32) over the same folds,
+prints a ranked table, and saves the best-F1 **full** configuration to
+`app/models/dsm5_head.pt`. Read it as: if a fusion config matches or beats
+scores-only, the notes can be combined without degradation; if only scores-only
+wins, the (synthetic) text carries no usable independent signal here.
 
 ---
 
