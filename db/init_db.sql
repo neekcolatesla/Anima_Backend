@@ -215,10 +215,14 @@ BEGIN
         med_status           INT           NULL,
         nlp_risk_score       DECIMAL(5,2)  NULL,
         final_combined_score DECIMAL(5,2)  NULL,
-        raw_answers          NVARCHAR(MAX) NULL,   -- questionnaire JSON payload
-        clinician_notes      NVARCHAR(MAX) NULL,   -- free-text NLP narrative (self/guardian/clinician)
+        raw_answers          NVARCHAR(MAX) NULL,   -- questionnaire JSON (one-time, immutable)
+        clinician_notes      NVARCHAR(MAX) NULL,   -- free-text narrative (editable: self/guardian/clinician)
+        notes_updated_at     DATETIME2     NULL,   -- audit: when clinician_notes was last edited
+        notes_updated_by     VARCHAR(10)   NULL,   -- audit: Users.user_ID of the last notes editor
         CONSTRAINT FK_DSM5_Patient
             FOREIGN KEY (patient_ID) REFERENCES dbo.Patient(patient_ID),
+        CONSTRAINT FK_DSM5_notes_updated_by
+            FOREIGN KEY (notes_updated_by) REFERENCES dbo.Users(user_ID),
         CONSTRAINT CK_DSM5_raw_answers_json
             CHECK (raw_answers IS NULL OR ISJSON(raw_answers) = 1)
     );
@@ -226,7 +230,31 @@ END
 GO
 
 /* ---------------------------------------------------------------------------
-   9. MRI - processed 2D slice paths + QC + image risk score per patient
+   8a. DSM5_Assessment notes provenance (idempotent; migrates older databases).
+       clinician_notes is the only editable field; these columns give every edit
+       a timestamp + attributed user for the Admin audit trail.
+--------------------------------------------------------------------------- */
+IF COL_LENGTH('dbo.DSM5_Assessment', 'notes_updated_at') IS NULL
+    ALTER TABLE dbo.DSM5_Assessment ADD notes_updated_at DATETIME2 NULL;
+IF COL_LENGTH('dbo.DSM5_Assessment', 'notes_updated_by') IS NULL
+    ALTER TABLE dbo.DSM5_Assessment ADD notes_updated_by VARCHAR(10) NULL;
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.foreign_keys
+    WHERE name = 'FK_DSM5_notes_updated_by'
+      AND parent_object_id = OBJECT_ID('dbo.DSM5_Assessment')
+)
+    ALTER TABLE dbo.DSM5_Assessment
+        ADD CONSTRAINT FK_DSM5_notes_updated_by
+            FOREIGN KEY (notes_updated_by) REFERENCES dbo.Users(user_ID);
+GO
+
+/* ---------------------------------------------------------------------------
+   9. MRI - processed 2D slice paths + QC + image risk score per patient.
+      LONGITUDINAL: a patient may have multiple scans over time. is_current = 1
+      marks the active scan per scan_type (enforced by a FILTERED unique index in
+      9a); superseded scans are retained as history (is_current = 0).
 --------------------------------------------------------------------------- */
 IF OBJECT_ID('dbo.MRI', 'U') IS NULL
 BEGIN
@@ -240,11 +268,43 @@ BEGIN
         qc_anatomical_1 VARCHAR(10)   NULL,
         qc_anatomical_2 VARCHAR(10)   NULL,
         mri_risk_score  DECIMAL(5,2)  NULL,
+        is_current      BIT           NOT NULL DEFAULT 1,   -- active scan per type
+        scan_session    INT           NOT NULL DEFAULT 1,   -- per-patient acquisition number
+        acquired_at     DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
         CONSTRAINT FK_MRI_Patient
-            FOREIGN KEY (patient_ID) REFERENCES dbo.Patient(patient_ID),
-        CONSTRAINT UQ_MRI_patient_scan UNIQUE (patient_ID, scan_type)
+            FOREIGN KEY (patient_ID) REFERENCES dbo.Patient(patient_ID)
     );
 END
+GO
+
+/* ---------------------------------------------------------------------------
+   9a. MRI longitudinal support (idempotent; migrates older databases).
+       Adds is_current / scan_session / acquired_at, drops the old one-scan-per-
+       type UNIQUE constraint, and replaces it with a FILTERED unique index so
+       only the CURRENT scan per (patient, scan_type) is unique - history kept.
+--------------------------------------------------------------------------- */
+IF COL_LENGTH('dbo.MRI', 'is_current') IS NULL
+    ALTER TABLE dbo.MRI ADD is_current BIT NOT NULL DEFAULT 1;
+IF COL_LENGTH('dbo.MRI', 'scan_session') IS NULL
+    ALTER TABLE dbo.MRI ADD scan_session INT NOT NULL DEFAULT 1;
+IF COL_LENGTH('dbo.MRI', 'acquired_at') IS NULL
+    ALTER TABLE dbo.MRI ADD acquired_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME();
+GO
+
+IF EXISTS (
+    SELECT 1 FROM sys.key_constraints
+    WHERE name = 'UQ_MRI_patient_scan' AND parent_object_id = OBJECT_ID('dbo.MRI')
+)
+    ALTER TABLE dbo.MRI DROP CONSTRAINT UQ_MRI_patient_scan;
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'UQ_MRI_current_scan' AND object_id = OBJECT_ID('dbo.MRI')
+)
+    CREATE UNIQUE INDEX UQ_MRI_current_scan
+        ON dbo.MRI (patient_ID, scan_type)
+        WHERE is_current = 1;
 GO
 
 /* ---------------------------------------------------------------------------
@@ -286,8 +346,53 @@ BEGIN
 END
 GO
 
+/* ---------------------------------------------------------------------------
+   12. Analysis_Result - append-only audit log of every analysis run.
+       Immutable history: one row per scoring run, capturing the derived scores,
+       the inputs used (which DSM-5 assessment + which MRI scan), which trained
+       model produced them, and who ran it and when. The "current" scores stay
+       cached on DSM5_Assessment / MRI for fast reads; THIS table is the
+       authoritative, never-updated audit trail for the Admin accountability
+       persona (previous versions are kept, new versions are appended).
+--------------------------------------------------------------------------- */
+IF OBJECT_ID('dbo.Analysis_Result', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.Analysis_Result (
+        analysis_ID          INT           IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        patient_ID           VARCHAR(15)   NOT NULL,
+        assessment_ID        INT           NULL,   -- DSM-5 assessment scored
+        MRI_ID               INT           NULL,   -- MRI scan used (current at run time)
+        nlp_risk_score       DECIMAL(5,2)  NULL,
+        mri_risk_score       DECIMAL(5,2)  NULL,
+        final_combined_score DECIMAL(5,2)  NULL,
+        predicted_subtype    VARCHAR(20)   NULL,
+        model_version        VARCHAR(50)   NULL,   -- which trained model produced it
+        created_at           DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
+        created_by           VARCHAR(10)   NULL,   -- Users.user_ID that triggered the run
+        CONSTRAINT FK_AnalysisResult_Patient
+            FOREIGN KEY (patient_ID) REFERENCES dbo.Patient(patient_ID),
+        CONSTRAINT FK_AnalysisResult_Assessment
+            FOREIGN KEY (assessment_ID) REFERENCES dbo.DSM5_Assessment(assessment_ID),
+        CONSTRAINT FK_AnalysisResult_MRI
+            FOREIGN KEY (MRI_ID) REFERENCES dbo.MRI(MRI_ID),
+        CONSTRAINT FK_AnalysisResult_User
+            FOREIGN KEY (created_by) REFERENCES dbo.Users(user_ID)
+    );
+END
+GO
+
+/* Common audit query: a patient's analysis runs, newest first. */
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_AnalysisResult_patient_time'
+      AND object_id = OBJECT_ID('dbo.Analysis_Result')
+)
+    CREATE INDEX IX_AnalysisResult_patient_time
+        ON dbo.Analysis_Result (patient_ID, created_at DESC);
+GO
+
 /* ===========================================================================
-   12. Seed the initial system administrator
+   13. Seed the initial system administrator
        user_ID = 'A' + admin_ID  =>  'A000001'
        password = 'password'  (bcrypt hash below; NEVER store plaintext)
 
