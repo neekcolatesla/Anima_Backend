@@ -62,23 +62,24 @@ def _score_with_model(age, biological_sex, is_child,
                       hyperactive_score, inattentive_score, clinical_notes):
     """Score via the trained hybrid head, or return None to trigger the fallback.
 
-    Lazily imports torch + the shared feature module so an import/download/model
-    failure degrades gracefully instead of taking down the endpoint. The head
-    contract (for the training branch): a torch module mapping a (1, 773) feature
-    tensor to a single logit; risk = sigmoid(logit) * 100.
+    Lazily imports torch + the shared modules so an import/download/model
+    failure degrades gracefully instead of taking down the endpoint. The head is
+    dsm5_model.DSM5Head (the exact class trained by train_dsm5.py); its saved
+    artifact is a state_dict, loaded via dsm5_model.load_head - safe under the
+    torch >= 2.6 weights_only default. risk = sigmoid(logit) * 100.
     """
     if not os.path.exists(HEAD_PATH):
         return None
     try:
         import torch
         import dsm5_features
+        import dsm5_model
 
         features = dsm5_features.build_feature_vector(
             age, biological_sex, is_child,
             hyperactive_score, inattentive_score, clinical_notes,
         )
-        head = torch.load(HEAD_PATH, map_location="cpu")
-        head.eval()
+        head = dsm5_model.load_head(HEAD_PATH)   # rebuilds DSM5Head + loads weights
         with torch.no_grad():
             logit = head(features.unsqueeze(0))
         prob = torch.sigmoid(logit).item()
