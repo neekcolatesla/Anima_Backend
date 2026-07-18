@@ -9,6 +9,81 @@ PowerShell / VS Code. Docker manages the Linux container for you.
 
 ---
 
+## Quick start: whole stack in one command (auto-seed)
+
+For evaluators, the fastest path is to let Docker do everything. Two prerequisites
+first, both from the repo root:
+
+- A `.env` file (copy `.env.example` → `.env` and fill it in — see §2).
+- The 1-129 seed CSVs present in `data/`: `NYU_Athena_Phenotypic_1-129.csv` and
+  `DSM5_data_1-129.csv`. **These are not in the git repo** — the ADHD-200 source
+  data is kept out of version control, so the files are provided with the project
+  folder/zip. If you only have a bare clone, place them in `data/` before running.
+
+Then:
+
+```powershell
+docker compose up
+```
+
+This starts three services in order:
+
+1. **db** — SQL Server, waits until it reports healthy;
+2. **seed** — a one-shot container that runs `db/init_db.sql` (schema + seed
+   admin) and loads the 1-129 patients from `data/`, then exits;
+3. **api** — FastAPI on <http://localhost:8000> (and `/docs`), started only once
+   the seed has completed successfully.
+
+When it finishes you have a populated database **and** a running API with no
+manual steps. The seeder is idempotent, so re-running `docker compose up` is
+safe — it skips patients that already exist. The held-out 130-222 set is never
+loaded here.
+
+> Notes: Bio_ClinicalBERT is **baked into the API image** at build time, so the
+> running API needs no network — the ~440 MB model download happens once during
+> `docker compose build` (which needs internet), not at request time. The trained
+> model `app/models/dsm5_head.pt` must be present for real (non-heuristic)
+> predictions; it ships with the project folder.
+
+The rest of this document is the **manual / development** path: run SQL Server in
+Docker but drive seeding and training from your Windows `.venv`.
+
+---
+
+## The API image (offline model bake)
+
+The API's text model uses Bio_ClinicalBERT. Rather than downloading it from
+Hugging Face on the first request, the `Dockerfile` **bakes it into the image** so
+the running container is fully self-contained.
+
+- **At build time** (`docker compose build` / `up --build`): the Dockerfile runs
+  `scripts/predownload_model.py`, which downloads the model (~440 MB) into the
+  image's Hugging Face cache at `HF_HOME=/opt/hf-cache`. This needs internet
+  **once**, and is cached as its own image layer — later builds skip it unless the
+  Dockerfile or that script changes. (It is placed before the app `COPY`, so
+  editing application code doesn't invalidate the expensive download layer.)
+- **At run time**: the image sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`,
+  so the API loads the model straight from the baked cache with **no network
+  calls** — it works even air-gapped. The `./app:/app` dev mount doesn't disturb
+  this, since the cache lives outside `/app`.
+
+Practical implications:
+
+- The image is large (PyTorch + the baked model, several GB) — expected.
+- The `seed` and `api` services share one image; the model layer is
+  content-addressed, so it is stored once, not duplicated.
+- To confirm the offline load, score a patient and watch the `anima_api` logs:
+  `Loading clinical language model ...` → `Clinical language model loaded.` with
+  **no** `huggingface.co` request lines between them, and `scoring_method: model`
+  in the response.
+- To point at a different model, set `CLINICAL_BERT_MODEL` and rebuild with
+  `--build` so the new model is baked in.
+
+See `README_TRAINING.md` → "Pre-downloading the model & offline mode" for the
+host (`.venv`) equivalent used by the training and test scripts.
+
+---
+
 ## 0. Repo layout
 
 ```
@@ -23,18 +98,27 @@ Anima_Backend/
 │   ├── MRI_Analysis.py
 │   ├── DSM5_Assessment.py
 │   ├── DSM5_Analysis.py
-│   ├── dsm5_features.py
-│   └── seed_db.py       # <- run this to create + populate the database
+│   ├── dsm5_features.py       # shared BERT + demographic feature builder
+│   ├── dsm5_model.py          # trained head architecture (shared train/serve)
+│   ├── train_dsm5.py          # DSM-5 model training (see README_TRAINING.md)
+│   ├── test_analysis.py       # smoke-test the analysis endpoint
+│   ├── seed_db.py             # <- run this to create + populate the database
+│   └── models/
+│       └── dsm5_head.pt       # trained weights (ships with the folder)
 ├── db/
 │   └── init_db.sql      # schema + seed admin (single source of truth)
-├── data/                # seed CSVs (git-ignored)
+├── data/                # seed CSVs (git-ignored, delivered with the folder)
 │   ├── NYU_Athena_Phenotypic_1-129.csv
 │   └── DSM5_data_1-129.csv
 ├── scripts/
-│   └── generate_dsm5_dataset.py   # dev tooling (synthetic DSM-5 generator)
+│   ├── generate_dsm5_dataset.py   # dev tooling (synthetic DSM-5 generator)
+│   └── predownload_model.py       # cache Bio_ClinicalBERT (offline / image bake)
 ├── docker-compose.yml
-├── Dockerfile
+├── Dockerfile                     # bakes Bio_ClinicalBERT for offline runtime
 ├── requirements.txt
+├── README_DB_SETUP.md
+├── README_TRAINING.md
+├── LIMITATIONS.md
 ├── .env                 # your local secrets (git-ignored)
 └── .env.example
 ```
@@ -180,6 +264,12 @@ python -c "from database import get_connection; c=get_connection(); cur=c.cursor
 The training script reads the same `.env`, so with `DB_HOST=localhost` it
 connects to the container automatically — no extra config. Features come from
 `Patient` + `DSM5_Assessment`; the training label is `ground_truth_dx`.
+
+The text model uses Bio_ClinicalBERT, which downloads (~440 MB) from Hugging Face
+on first use. To avoid depending on the network at startup (recommended for demos
+/ locked-down machines), pre-download it once with `python scripts/predownload_model.py`
+and set `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1` in `.env`. See
+`README_TRAINING.md` → "Pre-downloading the model & offline mode" for details.
 
 ---
 

@@ -29,6 +29,58 @@ explainability is intentionally not included yet.
 - Internet access on first run: Bio_ClinicalBERT (~440 MB) downloads once from
   Hugging Face and is then cached under your user profile for all later runs.
 
+### Pre-downloading the model & offline mode
+
+By default the app contacts Hugging Face on every startup to check the cache
+(even though the weights are already local), so startup depends on the network.
+To make it fully offline and faster — recommended for demos on flaky wifi, and
+required on locked-down machines — pre-download the model once, then switch to
+offline mode.
+
+```powershell
+# 1. cache the model (run once, while online; a no-op if already cached)
+python scripts\predownload_model.py
+```
+
+```ini
+# 2. add to .env  (already set on the dev machine)
+HF_HUB_OFFLINE=1
+TRANSFORMERS_OFFLINE=1
+```
+
+With those flags set, `train_dsm5.py`, `test_analysis.py`, and the API load
+Bio_ClinicalBERT straight from the local cache with **no network calls**. `.env`
+is read before transformers is imported, so the flags take effect automatically.
+
+**Verifying it works.** The training/test scripts load the model immediately, so
+the `https://huggingface.co/...` request lines just won't appear. The API loads
+the model **lazily on the first** `POST /api/analysis/dsm5/{id}` call (not at
+startup), so a clean startup log alone doesn't prove it — score one patient and
+check the response:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/analysis/dsm5/0010001"
+```
+
+A response with `"scoring_method": "model"` (and a risk score identical to an
+online run) confirms the model loaded from the cache — had the offline load
+failed, the endpoint would have fallen back to `"scoring_method": "heuristic"`.
+In the server logs you'll see `Loading clinical language model ...` →
+`Clinical language model loaded.` with **no** Hugging Face request lines between
+them.
+
+The pre-download script forces online mode for itself, so it works even with the
+flags set. Run it **before** relying on offline mode: if offline startup ever
+errors that it cannot find or reach the model, a needed file was not cached —
+re-run `predownload_model.py` online, or temporarily remove the two flags.
+
+For the **Docker image this is already wired**: the `Dockerfile` runs
+`predownload_model.py` during the build (baking the model into the image's HF
+cache at `HF_HOME=/opt/hf-cache`) and sets `HF_HUB_OFFLINE=1` /
+`TRANSFORMERS_OFFLINE=1`, so the containerised API loads the model from the baked
+cache with no network at runtime. The one-time download happens during
+`docker compose build`, which needs internet.
+
 ---
 
 ## 2. Run it
@@ -165,8 +217,9 @@ The winning weights are saved to `app/models/dsm5_head.pt` — the exact path
 these weights via `dsm5_model.load_head()`, and scores with the trained model
 instead of the transparent heuristic fallback. Nothing else needs wiring.
 
-The artifact is a **state_dict** (tensors only), so it loads safely under the
-`weights_only=True` default of torch ≥ 2.6.
+The artifact is a `{config, state_dict}` dict of tensors + primitives (the config
+records the architecture, e.g. the note-PCA size), so `load_head()` rebuilds the
+exact model and it loads safely under the `weights_only=True` default of torch ≥ 2.6.
 
 ---
 
@@ -208,16 +261,87 @@ wins, the (synthetic) text carries no usable independent signal here.
 
 ---
 
-## 7. Troubleshooting
+## 7. Testing the trained model
+
+Two ways to exercise the trained model against the **seeded 1–129 patients**. The
+held-out 130–222 block is never touched by either (it was never seeded), so it
+stays sealed for the moderated sessions.
+
+> These are **functional smoke tests** — "does the trained head load and return
+> sensible outputs through the real endpoint code?" — not a performance
+> measurement. The model was trained/cross-validated on these same patients, so
+> scoring them again is optimistic by construction; the honest metrics are the
+> 5-fold CV numbers above and in `LIMITATIONS.md`.
+
+### 7a. Batch smoke test — `test_analysis.py`
+
+Runs every seeded patient through the real `DSM5_Analysis.analyze_patient()`
+path (the exact code the endpoint calls): loads the trained head, builds the
+features, scores risk, predicts subtype, and writes `nlp_risk_score` back to the
+DB.
+
+```powershell
+cd app
+python test_analysis.py              # all 129 seeded patients
+python test_analysis.py --limit 15   # quicker sample
+python test_analysis.py --patient 0010001   # a single patient
+```
+
+What to check in the summary:
+
+- `Used trained model: 129/129` — confirms the trained PCA head is in use (not
+  the heuristic fallback). Any `heuristic` rows mean the head didn't load.
+- `Mean risk – ADHD` clearly above `Mean risk – Control` — the model learned the
+  right direction.
+- The architecture line reports the shipped config, e.g. `PCA-8 fusion`.
+
+### 7b. Live API endpoint
+
+Start the server from `app/` (with the DB up and `.env` set to
+`DB_HOST=localhost`):
+
+```powershell
+cd app
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Score patients from a second terminal — use real seeded IDs (`0010001`–`0010129`):
+
+```powershell
+foreach ($id in '0010001','0010005','0010016','0010049') {
+  Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/analysis/dsm5/$id"
+}
+```
+
+Each call returns `{ status, patient_ID, nlp_risk_score, predicted_subtype,
+scoring_method }`. The first request is slow (Bio_ClinicalBERT loads into memory
+once), then subsequent calls are fast. Or open **http://localhost:8000/docs**,
+expand `POST /api/analysis/dsm5/{patient_id}`, and use **Try it out** — this
+Swagger page is the same endpoint the PowerApps frontend calls and is the
+cleanest thing to show in a demo.
+
+> **Offline / demo tip:** make startup network-independent and faster by
+> pre-downloading the model and enabling offline mode — see
+> "Pre-downloading the model & offline mode" under Prerequisites.
+
+---
+
+## 8. Troubleshooting
 
 - **`ModuleNotFoundError: sklearn`** — `pip install scikit-learn` in the active
   `.venv` (it's in `requirements.txt`; reinstall if your venv predates it).
 - **Hugging Face download fails / offline** — the first run needs internet to
-  fetch Bio_ClinicalBERT; after that it's cached. On a locked-down machine,
-  pre-download the model once on a connected machine (same user profile cache).
+  fetch Bio_ClinicalBERT; after that it's cached. Run `scripts/predownload_model.py`
+  once while online, then set `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1` in
+  `.env` (see "Pre-downloading the model & offline mode" above).
 - **`No labelled patients` / count is 0** — the database isn't seeded; run
   `python seed_db.py` first (see `README_DB_SETUP.md`).
 - **`OSError [Errno 22]` importing numpy/torch** — the `.venv` is inside OneDrive;
   recreate it on a local path such as `C:\venvs\anima` (see `README_DB_SETUP.md`).
 - **Slow first run** — expected; it's the one-time model download + embedding
   129 clinical notes. Later runs reuse the cache.
+- **`UNEXPECTED` keys in a BertModel load report** (`cls.predictions.*`,
+  `cls.seq_relationship.*`) — **expected and harmless**. Bio_ClinicalBERT ships
+  with a masked-language-model head that is discarded when the model is loaded as
+  a plain encoder (`AutoModel`); those are the discarded head weights, not a
+  problem with the download or the model.

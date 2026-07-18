@@ -16,12 +16,45 @@ services:
       # Persist database files across container restarts
       - mssql_data:/var/opt/mssql
     healthcheck:
-      # API waits until SQL Server is actually accepting connections
+      # Downstream services wait until SQL Server is actually accepting connections
       test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -C -Q \"SELECT 1\" || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 30s
+    networks:
+      - anima_net
+
+  # ---------------------------------------------------------------------------
+  # Seed - one-shot: create schema + seed admin (init_db.sql) and load the
+  # 1-129 patients, then EXIT. Idempotent (seed_db.py skips existing patients),
+  # so it is safe to run on every `docker compose up`. Runs only after the DB is
+  # healthy; the API waits for this to complete before starting.
+  # ---------------------------------------------------------------------------
+  seed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: anima_seed
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: "1433"
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      # Needed to encrypt patient names at rest during the load
+      FERNET_KEY: ${FERNET_KEY}
+    volumes:
+      - ./app:/app
+      # seed_db.py resolves its defaults to /data and /db inside the container
+      - ./data:/data
+      - ./db:/db
+    command: ["python", "seed_db.py"]
+    restart: "no"
     networks:
       - anima_net
 
@@ -39,6 +72,9 @@ services:
       db:
         # Start the API only once SQL Server reports healthy
         condition: service_healthy
+      seed:
+        # ...and only once the database has been seeded
+        condition: service_completed_successfully
     environment:
       # Database credentials + connection details (from .env)
       DB_HOST: db

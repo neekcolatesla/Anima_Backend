@@ -2,12 +2,13 @@
 .venv/
 venv/
 
-# Secrets and Config
+# Secrets and config
 .env
 
-# Data files (seed CSVs live in data/, held-out sets stay off the repo)
+# Data files: keep ALL CSVs out of the (public) repo. The ADHD-200-derived seed
+# set and the held-out 130-222 set are delivered with the project folder/zip,
+# not via git. Place them in data/ before running the seeder.
 *.csv
-data/*.csv
 
 # Processed MRI output (generated into the Docker volume)
 app/static/mri_images/
