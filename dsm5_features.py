@@ -37,7 +37,12 @@ from functools import lru_cache
 from typing import Optional, Sequence, Union
 
 import torch
+import transformers
 from transformers import AutoTokenizer, AutoModel
+
+# Quieten the verbose weight-load report (the "UNEXPECTED keys" table is the
+# expected MLM head we discard when loading Bio_ClinicalBERT as a plain encoder).
+transformers.logging.set_verbosity_error()
 
 logger = logging.getLogger("anima.dsm5.features")
 
