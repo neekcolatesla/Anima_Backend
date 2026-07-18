@@ -1,89 +1,110 @@
 """
-Anima - FastAPI application entrypoint.
+Anima - security utilities.
 
-Initialises the FastAPI app, configures CORS middleware, mounts the static
-directory that serves processed 2D MRI slices, and establishes the initial
-SQL Server connection (via pyodbc) on startup.
+Provides:
+  * Password hashing and verification using ``bcrypt``.
+  * Symmetric field-level encryption/decryption using
+    ``cryptography.fernet`` (keyed by the FERNET_KEY environment variable).
+
+These helpers back the Users authentication supertype (password_hash) and the
+encryption of sensitive PHI/PII fields before they are persisted to SQL Server.
 """
 
 import os
 import logging
 
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+import bcrypt
+from cryptography.fernet import Fernet, InvalidToken
+from dotenv import load_dotenv
 
-import pyodbc
+load_dotenv()
 
-from database import get_db, wait_for_db, DB_NAME
+logger = logging.getLogger("anima.security")
 
-# --- Logging -----------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("anima.main")
+# =============================================================================
+# Password hashing (bcrypt)
+# =============================================================================
+# bcrypt has a hard 72-byte input limit; longer passwords are silently
+# truncated by the algorithm. We encode to UTF-8 explicitly.
 
-# --- Application -------------------------------------------------------------
-app = FastAPI(
-    title="Anima API",
-    description="AI-integrated ADHD diagnosis support backend.",
-    version="0.1.0",
-)
+def hash_password(password: str) -> str:
+    """Hash a plaintext password with a per-password bcrypt salt.
 
-# --- CORS middleware ---------------------------------------------------------
-# PowerApps / Outlook clients call this API from different origins.
-# Override with a comma-separated ALLOWED_ORIGINS env var in production.
-_origins_env = os.getenv("ALLOWED_ORIGINS", "*")
-allowed_origins = (
-    ["*"] if _origins_env.strip() == "*"
-    else [o.strip() for o in _origins_env.split(",") if o.strip()]
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Static files: processed MRI slices --------------------------------------
-# Matches the Docker volume mount at /app/static/mri_images.
-STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-os.makedirs(os.path.join(STATIC_DIR, "mri_images"), exist_ok=True)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    Returns the full modular-crypt hash string (algorithm + cost + salt +
+    digest) suitable for storing in ``Users.password_hash``.
+    """
+    if not password:
+        raise ValueError("Password must not be empty.")
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode("utf-8"), salt)
+    return hashed.decode("utf-8")
 
 
-# --- Lifecycle events --------------------------------------------------------
-@app.on_event("startup")
-def on_startup() -> None:
-    """Block until SQL Server is reachable so the API doesn't serve traffic
-    before its database dependency is available."""
-    logger.info("Anima API starting up - checking SQL Server connectivity...")
-    if not wait_for_db():
-        # Log loudly but let the app start so /health can report the problem.
-        logger.error("Startup completed WITHOUT a confirmed database connection.")
-    else:
-        logger.info("Database connectivity confirmed.")
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify a plaintext password against a stored bcrypt hash.
 
-
-# --- Routes ------------------------------------------------------------------
-@app.get("/")
-def root() -> dict:
-    """Basic liveness/info endpoint."""
-    return {
-        "service": "Anima API",
-        "version": app.version,
-        "status": "online",
-    }
-
-
-@app.get("/health")
-def health(conn: pyodbc.Connection = Depends(get_db)) -> dict:
-    """Readiness check that verifies a live query against SQL Server."""
+    Returns ``False`` on any malformed hash rather than raising, so auth
+    endpoints can treat it uniformly as an invalid credential.
+    """
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1;")
-        cursor.fetchone()
-        return {"status": "healthy", "database": DB_NAME}
-    except pyodbc.Error as exc:
-        logger.exception("Health check DB query failed.")
-        raise HTTPException(status_code=503, detail=f"Database unavailable: {exc}")
+        return bcrypt.checkpw(
+            password.encode("utf-8"),
+            password_hash.encode("utf-8"),
+        )
+    except (ValueError, TypeError):
+        logger.warning("Password verification received a malformed hash.")
+        return False
+
+
+# =============================================================================
+# Symmetric encryption (cryptography.fernet)
+# =============================================================================
+
+def _load_fernet() -> Fernet:
+    """Build the Fernet instance from the FERNET_KEY environment variable.
+
+    The key must be a 32-byte url-safe base64-encoded string. Generate one with:
+        python -c "from cryptography.fernet import Fernet; \\
+                   print(Fernet.generate_key().decode())"
+    """
+    key = os.getenv("FERNET_KEY")
+    if not key:
+        raise RuntimeError(
+            "FERNET_KEY is not set. Add it to your .env file. Generate with: "
+            "python -c \"from cryptography.fernet import Fernet; "
+            "print(Fernet.generate_key().decode())\""
+        )
+    try:
+        return Fernet(key.encode("utf-8") if isinstance(key, str) else key)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(f"Invalid FERNET_KEY: {exc}") from exc
+
+
+# Instantiated once at import time so a bad/missing key fails fast on startup.
+_fernet = _load_fernet()
+
+
+def encrypt_value(plaintext: str) -> str:
+    """Encrypt a string value, returning a url-safe base64 token (str)."""
+    if plaintext is None:
+        raise ValueError("Cannot encrypt None.")
+    token = _fernet.encrypt(plaintext.encode("utf-8"))
+    return token.decode("utf-8")
+
+
+def decrypt_value(token: str) -> str:
+    """Decrypt a Fernet token back to its original string.
+
+    Raises ``InvalidToken`` if the token is tampered with or was encrypted
+    under a different key.
+    """
+    try:
+        return _fernet.decrypt(token.encode("utf-8")).decode("utf-8")
+    except InvalidToken:
+        logger.error("Failed to decrypt value - invalid or tampered token.")
+        raise
+
+
+def generate_fernet_key() -> str:
+    """Convenience helper to generate a fresh Fernet key (for setup scripts)."""
+    return Fernet.generate_key().decode("utf-8")
