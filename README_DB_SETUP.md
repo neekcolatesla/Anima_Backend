@@ -94,7 +94,7 @@ Anima_Backend/
 │   ├── security.py
 │   ├── Auth_RBAC.py
 │   ├── CSV_Ingestion.py
-│   ├── MRI_Ingestion.py
+│   ├── MRI_Ingestion.py       # /api/ingest/mri + shared longitudinal core
 │   ├── MRI_Analysis.py
 │   ├── DSM5_Assessment.py
 │   ├── DSM5_Analysis.py
@@ -102,14 +102,17 @@ Anima_Backend/
 │   ├── dsm5_model.py          # trained head architecture (shared train/serve)
 │   ├── train_dsm5.py          # DSM-5 model training (see README_TRAINING.md)
 │   ├── test_analysis.py       # smoke-test the analysis endpoint
-│   ├── seed_db.py             # <- run this to create + populate the database
+│   ├── seed_db.py             # <- schema + demographics/DSM-5 data
+│   ├── seed_mri.py            # <- bulk-load MRI training scans (§4a)
 │   └── models/
 │       └── dsm5_head.pt       # trained weights (ships with the folder)
 ├── db/
 │   └── init_db.sql      # schema + seed admin (single source of truth)
 ├── data/                # seed CSVs (git-ignored, delivered with the folder)
 │   ├── NYU_Athena_Phenotypic_1-129.csv
-│   └── DSM5_data_1-129.csv
+│   ├── DSM5_data_1-129.csv
+│   └── mri/             # raw MRI scans (git-ignored; NOT committed)
+│       └── NYU_Athena_preproc_1-129/<patient>/*.nii.gz
 ├── scripts/
 │   ├── generate_dsm5_dataset.py   # dev tooling (synthetic DSM-5 generator)
 │   └── predownload_model.py       # cache Bio_ClinicalBERT (offline / image bake)
@@ -224,7 +227,11 @@ Seed complete.
 ```
 
 It's idempotent — safe to re-run (`init_db.sql` only creates missing objects,
-existing patients are skipped, assessments are enriched in place).
+existing patients are skipped, assessments are enriched in place). **Re-running
+also applies schema migrations**: after any `init_db.sql` change, `seed_db.py`
+brings your existing database up to date (adding new columns/tables), so the
+batch count rises — e.g. the longitudinal-MRI + audit changes take it from 15 to
+**22 batches**. Run it once after pulling schema changes and before `seed_mri`.
 
 To seed a different set (e.g. the full set, or the held-out block), point it at
 other files:
@@ -240,6 +247,67 @@ Useful flags:
 
 > If your filenames differ (capitalisation, `.csv` extension), pass the exact
 > paths with `--phenotypic` / `--dsm5`.
+
+---
+
+## 4a. Load the MRI training scans (`seed_mri`)
+
+Bulk-loads every patient's MRI scans for training the image model, using the same
+core as the live `POST /api/ingest/mri` endpoint so seeded rows match a real
+ingest.
+
+**Prerequisites:** the database is up (§3), patients are already seeded (§4), the
+schema migration has been applied (re-run `seed_db.py` so the `is_current` /
+`scan_session` columns exist), and the scans are on disk as per-patient folders:
+
+```
+data\mri\NYU_Athena_preproc_1-129\
+├── 0010001\   wssd0010001_session_1_anat.nii.gz   swssd0010001_session_1_anat_gm.nii.gz
+├── 0010002\   ...
+└── 0010129\   ...
+```
+
+The folder name is the `patient_ID`; each holds one `*anat.nii(.gz)` and one
+`*_anat_gm.nii(.gz)`. These scans are **git-ignored** (large ADHD-200 data), so
+they live in the repo folder for the seeder but are never committed.
+
+Smoke-test with 3 patients first, then run the full set (from `app`):
+
+```powershell
+python seed_mri.py --mri-dir ..\data\mri\NYU_Athena_preproc_1-129 --limit 3
+python seed_mri.py --mri-dir ..\data\mri\NYU_Athena_preproc_1-129
+```
+
+Each patient is committed in its own transaction, so one bad folder never sinks
+the batch. Each patient yields **378 slices** (189 per scan × the two scans), so
+the full run writes ~**48,762** JPEGs across 129 patients and is slow.
+
+Smoke-test output (`--limit 3`):
+
+```
+  ok   0010001: 378 slices across 2 scan(s) (session 1)
+  ok   0010002: 378 slices across 2 scan(s) (session 1)
+  ok   0010003: 378 slices across 2 scan(s) (session 1)
+MRI seed complete.
+  Ingested:     3
+  Skipped:      0
+  Failed:       0
+  Total slices: 1134
+```
+
+The full run ends with `Ingested: 129 ... Total slices: 48762`.
+
+Useful flags:
+
+- `--skip-existing` — skip patients that already have a current scan (resumable).
+- `--limit N` — only the first N folders; `--patient 0010001` — a single patient.
+- `--mode replace|new_session` — how to treat a patient that already has scans.
+  `replace` (default) corrects the current scan; `new_session` keeps the old scan
+  as history (`is_current = 0`) and adds the new one as current (see the
+  longitudinal MRI model).
+
+> Hitting a `localhost,1433 ... Server is not found` connection timeout means the
+> database container isn't running — start it with `docker compose up -d db`.
 
 ---
 
