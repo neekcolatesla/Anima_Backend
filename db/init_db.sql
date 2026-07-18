@@ -125,12 +125,18 @@ GO
    6. Patient - SUBTYPE
       user_ID is NULLABLE: child patients (is_child = 1) cannot log in.
       guardian_ID (NULLABLE FK) implements "a guardian manages 0..* patients".
+
+      user_ID uniqueness is enforced by a FILTERED unique index (created just
+      below), NOT an inline UNIQUE constraint. SQL Server treats NULLs as equal
+      in a plain UNIQUE constraint, so it would permit only ONE NULL row - but
+      every child patient has a NULL user_ID, so a second child would collide.
+      The filtered index enforces uniqueness only where user_ID IS NOT NULL.
 --------------------------------------------------------------------------- */
 IF OBJECT_ID('dbo.Patient', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.Patient (
         patient_ID      VARCHAR(15)   NOT NULL PRIMARY KEY,
-        user_ID         VARCHAR(10)   NULL UNIQUE,
+        user_ID         VARCHAR(10)   NULL,
         guardian_ID     VARCHAR(7)    NULL,
         name            VARCHAR(500)  NULL,
         biological_sex  INT           NULL,
@@ -144,6 +150,36 @@ BEGIN
             CHECK (user_ID IS NULL OR user_ID = 'P' + patient_ID)
     );
 END
+GO
+
+/* ---------------------------------------------------------------------------
+   6a. Patient.user_ID uniqueness - NULL-tolerant.
+       Heals older databases too: drop any legacy plain UNIQUE constraint on
+       Patient(user_ID) (it was auto-named, e.g. UQ__Patient__...), then create
+       the filtered unique index if it is missing. Both steps are idempotent.
+--------------------------------------------------------------------------- */
+DECLARE @legacy_uq SYSNAME;
+SELECT @legacy_uq = kc.name
+FROM sys.key_constraints AS kc
+JOIN sys.index_columns  AS ic
+     ON ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id
+JOIN sys.columns        AS c
+     ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE kc.parent_object_id = OBJECT_ID('dbo.Patient')
+  AND kc.type = 'UQ'
+  AND c.name = 'user_ID';
+
+IF @legacy_uq IS NOT NULL
+    EXEC('ALTER TABLE dbo.Patient DROP CONSTRAINT ' + @legacy_uq);
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'UQ_Patient_user_ID' AND object_id = OBJECT_ID('dbo.Patient')
+)
+    CREATE UNIQUE INDEX UQ_Patient_user_ID
+        ON dbo.Patient (user_ID)
+        WHERE user_ID IS NOT NULL;
 GO
 
 /* ---------------------------------------------------------------------------
