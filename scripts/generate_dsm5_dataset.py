@@ -222,75 +222,105 @@ def build_raw_answers(is_child, ia_answers, hi_answers, ia_t, hi_t):
 # =============================================================================
 # 5. Clinician / guardian notes generation
 # =============================================================================
-def _severity(raw_sum):
-    if raw_sum <= 9:
-        return "minimal"
-    if raw_sum <= 18:
-        return "mild"
-    if raw_sum <= 27:
-        return "moderate"
-    return "marked"
+# Behaviour phrases (present-tense, so they read as "The patient <phrase>").
+# The SAME vocabulary is used for every patient - ADHD and control notes differ
+# only in which behaviours happen to be mentioned, never in the words available.
+INATTENTIVE_PHRASES = [
+    "loses focus partway through tasks",
+    "is easily distracted by things nearby",
+    "makes careless slips on routine work",
+    "does not always seem to listen when addressed",
+    "finds it hard to organise tasks and belongings",
+    "avoids activities needing sustained mental effort",
+    "misplaces everyday items",
+    "is forgetful with daily routines",
+    "leaves activities unfinished",
+]
+HYPERACTIVE_PHRASES = [
+    "fidgets or taps when seated",
+    "finds it hard to stay seated",
+    "comes across as restless",
+    "talks a great deal",
+    "finds it hard to wait for a turn",
+    "interrupts or intrudes on others",
+    "seems constantly on the go",
+    "finds it hard to play or work quietly",
+    "acts before thinking it through",
+]
+# Neutral, non-diagnostic filler - present for everyone, carries NO label signal.
+FILLER = [
+    "Sleep and appetite were reported as unremarkable.",
+    "Rapport was established easily during the session.",
+    "No acute distress was observed.",
+    "Family history was reviewed and is non-contributory.",
+    "The informant was cooperative and engaged.",
+    "General health was described as good.",
+    "Mood appeared stable throughout the assessment.",
+    "The session ran to time without difficulty.",
+]
+OPENERS_CHILD = [
+    "Observations were gathered from the caregiver, teacher, and clinician.",
+    "The following notes were collated during the school-age assessment.",
+    "Caregiver and classroom input was reviewed alongside clinician observation.",
+]
+OPENERS_ADULT = [
+    "Observations were gathered from self-report and clinician interview.",
+    "The following notes were collated during the assessment.",
+    "Self-report and an informant account were reviewed alongside clinician observation.",
+]
 
 
-def _pronouns(gender):
-    # ADHD-200 Gender: 1 = Male, 0 = Female.
-    if gender == 1:
-        return ("he", "him", "his")
-    if gender == 0:
-        return ("she", "her", "her")
-    return ("they", "them", "their")
+def _mention_prob(raw_sum, signal, base=0.15):
+    """Probability that a given symptom from a subscale is written into the note.
+
+    Blends a severity-driven 'true' probability with a flat NOISE baseline that is
+    identical for every patient. At signal=0.25, only a quarter of the decision
+    reflects the real symptom profile and three quarters is uninformative noise,
+    so the notes carry weak, realistic signal instead of restating the diagnosis.
+    """
+    p_true = min(max(raw_sum / (N_ITEMS * MAX_LIKERT), 0.0), 1.0)
+    return signal * p_true + (1.0 - signal) * base
 
 
-def generate_notes(dx, is_child, gender, ia_raw, hi_raw, rng):
-    subj = "the student" if is_child else "the patient"
-    he, him, his = _pronouns(gender)
+def _mention(phrases, raw_sum, signal, rng):
+    p = _mention_prob(raw_sum, signal)
+    return [ph for ph in phrases if rng.random() < p]
 
-    if is_child:
-        openers = ["The parent and classroom teacher report that",
-                   "According to guardian and teacher observations,",
-                   "Home and school reports indicate that",
-                   "Caregiver and teacher feedback notes that"]
-        impact_adhd = ["which is disrupting schoolwork and daily routines.",
-                       "affecting classroom participation and homework completion.",
-                       "with a clear impact on learning and peer interactions."]
-        impact_ctrl = ["with no notable impact on schoolwork or behaviour.",
-                       "and functioning at school appears age-appropriate."]
+
+def generate_notes(is_child, ia_raw, hi_raw, rng, signal=0.25):
+    """Symptom-level clinical note with diluted signal and NO diagnosis stated.
+
+    The diagnosis/subtype is never named. Behaviours are mentioned probabilistically
+    (mostly noise), drawn from one shared vocabulary for ADHD and control patients,
+    and wrapped in neutral filler - so ADHD and control notes overlap heavily and
+    the text is not a give-away for the label. `signal` (0..1) is the mixing weight
+    between the true symptom profile and the flat noise baseline.
+    """
+    subj = "The student" if is_child else "The patient"
+    openers = OPENERS_CHILD if is_child else OPENERS_ADULT
+
+    noted = (_mention(INATTENTIVE_PHRASES, ia_raw, signal, rng)
+             + _mention(HYPERACTIVE_PHRASES, hi_raw, signal, rng))
+    order = rng.permutation(len(noted)) if noted else []
+    noted = [noted[i] for i in order]
+
+    parts = [str(rng.choice(openers))]
+    if noted:
+        shown = noted[:3]                       # keep notes short and overlapping
+        if len(shown) == 1:
+            parts.append(f"{subj} {shown[0]}.")
+        elif len(shown) == 2:
+            parts.append(f"{subj} {shown[0]} and {shown[1]}.")
+        else:
+            parts.append(f"{subj} " + ", ".join(shown[:-1]) + f", and {shown[-1]}.")
     else:
-        openers = ["The patient self-reports that",
-                   "During the clinical interview, the patient described that",
-                   "Self-report and clinician observation indicate that",
-                   "The patient and a close informant report that"]
-        impact_adhd = ["which is interfering with work performance and daily organisation.",
-                       "affecting occupational functioning and time management.",
-                       "with a clear impact on work and personal responsibilities."]
-        impact_ctrl = ["with no notable impact on work or daily functioning.",
-                       "and overall functioning appears within normal limits."]
+        parts.append("No specific attentional or behavioural concerns were raised "
+                     "at this time.")
 
-    opener = rng.choice(openers)
-
-    if dx == 0:  # control
-        body = (f"{subj} shows attention and activity levels within the expected "
-                f"range for {his} age, with only occasional, situational lapses")
-        impact = rng.choice(impact_ctrl)
-        return f"{opener} {body} {impact}"
-
-    ia_sev, hi_sev = _severity(ia_raw), _severity(hi_raw)
-    inatt_txt = (f"{ia_sev} inattentive symptoms - {he} is easily distracted, "
-                 f"loses focus on tasks, and is often forgetful")
-    hyper_txt = (f"{hi_sev} hyperactive-impulsive symptoms - {he} is restless, "
-                 f"fidgety, and struggles to wait {his} turn")
-
-    if dx == 3:      # inattentive
-        symptoms = inatt_txt
-    elif dx == 2:    # hyperactive/impulsive
-        symptoms = hyper_txt
-    else:            # combined
-        symptoms = f"{inatt_txt}, together with {hi_sev} hyperactive-impulsive behaviour"
-
-    impact = rng.choice(impact_adhd)
-    label = DX_LABELS.get(dx, "ADHD")
-    return (f"{opener} {subj} presents with {symptoms}, {impact} "
-            f"Presentation is consistent with {label}.")
+    n_filler = int(rng.integers(1, 3))          # 1-2 neutral lines, same pool for all
+    for f in rng.choice(FILLER, size=n_filler, replace=False):
+        parts.append(str(f))
+    return " ".join(parts)
 
 
 # =============================================================================
@@ -303,6 +333,9 @@ def main():
     ap.add_argument("--output", default="DSM5_data.csv",
                     help="Path for the generated training CSV.")
     ap.add_argument("--seed", type=int, default=42, help="Random seed (reproducible).")
+    ap.add_argument("--signal", type=float, default=0.25,
+                    help="Fraction of the note's symptom content driven by the true "
+                         "profile vs flat noise (0..1). 0.25 = 25%% signal / 75%% noise.")
     args = ap.parse_args()
 
     try:
@@ -343,9 +376,9 @@ def main():
         # 4. Assemble the raw_answers JSON (mirrors the SQL raw_answers column).
         raw_answers = build_raw_answers(is_child, ia_answers, hi_answers, ia_t, hi_t)
 
-        # 5. Diagnosis- and age-appropriate clinician/guardian notes.
-        notes = generate_notes(dx if dx is not None else 0, is_child, gender,
-                               sum(ia_answers), sum(hi_answers), rng)
+        # 5. Symptom-level notes: diluted signal, diagnosis never stated.
+        notes = generate_notes(is_child, sum(ia_answers), sum(hi_answers),
+                               rng, args.signal)
 
         rows.append({
             "patient_ID": patient_id,

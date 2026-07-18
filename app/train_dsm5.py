@@ -164,11 +164,23 @@ def _subtype_breakdown(dx_subset: np.ndarray) -> str:
 # =============================================================================
 # 6. Train / evaluate one fold
 # =============================================================================
-def train_one_fold(X_tr, y_tr, X_te, y_te, epochs, lr, weight_decay):
-    """Standard full-batch PyTorch loop; returns (model, accuracy, f1)."""
-    model = dsm5_model.DSM5Head(input_dim=X_tr.shape[1])
-    # Standardise using TRAIN-fold stats only (no leakage), baked into the model.
-    model.set_normalization(X_tr.mean(dim=0), X_tr.std(dim=0))
+def train_one_fold(X_tr, y_tr, X_te, y_te, epochs, lr, weight_decay, note_pca_k=None):
+    """Standard full-batch PyTorch loop; returns (model, accuracy, f1).
+
+    If note_pca_k is set, a PCA is fitted on the TRAIN fold's note block and baked
+    into the model so the 768-d embedding is projected to note_pca_k dims (the
+    projection lives inside the model, so the API still feeds raw 773-d vectors).
+    """
+    model = dsm5_model.DSM5Head(input_dim=X_tr.shape[1], note_pca_k=note_pca_k)
+    if note_pca_k:
+        from sklearn.decomposition import PCA
+        notes_tr = X_tr[:, dsm5_model.STRUCTURED_DIM:].cpu().numpy()
+        pca = PCA(n_components=note_pca_k).fit(notes_tr)   # train-fold only (no leakage)
+        model.set_pca(pca.mean_, pca.components_)
+    # Standardise using TRAIN-fold stats of the PROCESSED features (no leakage).
+    with torch.no_grad():
+        proj_tr = model.project(X_tr)
+    model.set_normalization(proj_tr.mean(dim=0), proj_tr.std(dim=0))
 
     # Class imbalance -> weight the positive (ADHD) class in the loss.
     n_pos = float((y_tr == 1).sum())
@@ -195,6 +207,80 @@ def train_one_fold(X_tr, y_tr, X_te, y_te, epochs, lr, weight_decay):
     return model, acc, f1
 
 
+def run_cv(X, y_t, dx, folds, epochs, lr, weight_decay, verbose=False, note_pca_k=None):
+    """Run the CV loop over pre-built folds; returns per-fold metrics + best fold.
+
+    Reused for the full model and each ablation / fusion config, always over the
+    SAME folds so comparisons are apples-to-apples. Returns
+    (accs, f1s, best) where best = {f1, fold, acc, state, config}.
+    """
+    accs, f1s = [], []
+    best = {"f1": -1.0, "fold": None, "state": None, "acc": None, "config": None}
+    for fold, (tr_idx, te_idx) in enumerate(folds, start=1):
+        model, acc, f1 = train_one_fold(
+            X[tr_idx], y_t[tr_idx], X[te_idx], y_t[te_idx],
+            epochs=epochs, lr=lr, weight_decay=weight_decay, note_pca_k=note_pca_k,
+        )
+        accs.append(acc)
+        f1s.append(f1)
+        if verbose:
+            logger.info(
+                "Fold %d/%d | test n=%d | accuracy=%.3f | F1=%.3f | test subtypes: %s",
+                fold, len(folds), len(te_idx), acc, f1, _subtype_breakdown(dx[te_idx]),
+            )
+        if f1 > best["f1"]:
+            best.update(f1=f1, fold=fold, acc=acc,
+                        state=copy.deepcopy(model.state_dict()), config=model.config())
+    return accs, f1s, best
+
+
+def _save_best(best, path) -> None:
+    """Rebuild the winning fold's model from its config + weights and save it."""
+    model = dsm5_model.DSM5Head(**best["config"])
+    model.load_state_dict(best["state"])
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dsm5_model.save_head(model, path)
+
+
+def run_experiment(X, y_t, dx, folds, args) -> int:
+    """Compare fusion strategies (weight-decay sweep + note-PCA) on identical folds."""
+    sd = dsm5_features.STRUCTURED_DIM
+    # (label, feature matrix, note_pca_k, weight_decay)
+    configs = [
+        ("scores + demographics", X[:, :sd], None, args.weight_decay),
+        ("notes only (BERT)", X[:, sd:], None, args.weight_decay),
+    ]
+    for wd in (0.01, 0.1, 0.5, 1.0):
+        configs.append((f"full naive (wd={wd})", X, None, wd))
+    for k in (8, 16, 32):
+        configs.append((f"full PCA-{k} (wd={args.weight_decay})", X, k, args.weight_decay))
+
+    logger.info("\n=== Fusion experiment | %d-fold CV, identical folds ===", args.folds)
+    results = []
+    best_full = {"f1": -1.0, "state": None, "config": None, "name": None, "acc": None}
+    for name, X_cfg, k, wd in configs:
+        accs, f1s, best = run_cv(X_cfg, y_t, dx, folds, args.epochs, args.lr, wd,
+                                 note_pca_k=k)
+        results.append((name, np.mean(accs), np.std(accs), np.mean(f1s), np.std(f1s)))
+        logger.info("%-26s | accuracy=%.3f +/- %.3f | F1=%.3f +/- %.3f",
+                    name, np.mean(accs), np.std(accs), np.mean(f1s), np.std(f1s))
+        if name.startswith("full") and np.mean(f1s) > best_full["f1"]:
+            best_full.update(f1=np.mean(f1s), acc=np.mean(accs),
+                             state=best["state"], config=best["config"], name=name)
+
+    logger.info("\n=== Comparison (5-fold CV, ranked by F1) ===")
+    logger.info("%-26s %-18s %-18s", "configuration", "accuracy", "F1")
+    for name, am, asd, fm, fsd in sorted(results, key=lambda r: -r[3]):
+        logger.info("%-26s %6.3f +/- %.3f    %6.3f +/- %.3f", name, am, asd, fm, fsd)
+
+    logger.info("\nBest FULL configuration: %s (accuracy=%.3f, F1=%.3f)",
+                best_full["name"], best_full["acc"], best_full["f1"])
+    _save_best(best_full, args.output)
+    logger.info("Saved best full-model weights -> %s", args.output)
+    logger.info("DSM5_Analysis.py will load this automatically on the next call.")
+    return 0
+
+
 # =============================================================================
 # Entry point
 # =============================================================================
@@ -208,6 +294,14 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=42, help="Random seed (reproducibility).")
     ap.add_argument("--output", default=DEFAULT_OUTPUT,
                     help="Where to save the winning fold's weights.")
+    ap.add_argument("--no-ablation", dest="ablation", action="store_false",
+                    help="Skip the scores-only / notes-only ablation comparison.")
+    ap.add_argument("--note-pca", type=int, default=None,
+                    help="Project the 768-d note embedding to this many PCA dims "
+                         "before fusion (mitigates the notes swamping the scores).")
+    ap.add_argument("--experiment", action="store_true",
+                    help="Run the fusion sweep (weight-decay + note-PCA) and rank them.")
+    ap.set_defaults(ablation=True)
     args = ap.parse_args()
 
     np.random.seed(args.seed)
@@ -234,41 +328,60 @@ def main() -> int:
     logger.info("Feature matrix: %s", tuple(X.shape))
 
     # ---- 5. Stratified folds (rare hyperactive spread across folds) -----------
+    # Built ONCE and reused for the full model and every ablation slice, so all
+    # configurations are compared on identical train/test partitions.
     folds, _ = make_stratified_folds(dx, args.folds, args.seed)
 
-    # ---- 6 + 7 + 8. Train/test 5 times, report, track the best ----------------
-    fold_accs, fold_f1s = [], []
-    best = {"f1": -1.0, "fold": None, "state": None, "acc": None}
+    # ---- Optional: full fusion sweep (weight-decay + note-PCA) -----------------
+    if args.experiment:
+        return run_experiment(X, y_t, dx, folds, args)
 
-    logger.info("\n=== %d-fold stratified cross-validation ===", args.folds)
-    for fold, (tr_idx, te_idx) in enumerate(folds, start=1):
-        model, acc, f1 = train_one_fold(
-            X[tr_idx], y_t[tr_idx], X[te_idx], y_t[te_idx],
-            epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
-        )
-        fold_accs.append(acc)
-        fold_f1s.append(f1)
-        logger.info(
-            "Fold %d/%d | test n=%d | accuracy=%.3f | F1=%.3f | test subtypes: %s",
-            fold, args.folds, len(te_idx), acc, f1, _subtype_breakdown(dx[te_idx]),
-        )
+    # ---- 6 + 7 + 8. FULL model: train/test 5 times, report, track the best ----
+    pca_note = f" | note-PCA={args.note_pca}" if args.note_pca else ""
+    logger.info("\n=== FULL model | %d-fold stratified cross-validation ===", args.folds)
+    logger.info("features: scores + demographics + clinical-note embedding (%d dims)%s",
+                X.shape[1], pca_note)
+    full_accs, full_f1s, best = run_cv(
+        X, y_t, dx, folds, args.epochs, args.lr, args.weight_decay, verbose=True,
+        note_pca_k=args.note_pca,
+    )
+    logger.info("Summary | accuracy=%.3f +/- %.3f | F1=%.3f +/- %.3f | best fold #%d",
+                np.mean(full_accs), np.std(full_accs),
+                np.mean(full_f1s), np.std(full_f1s), best["fold"])
 
-        # 8. Keep the highest-F1 fold's weights.
-        if f1 > best["f1"]:
-            best.update(f1=f1, fold=fold, acc=acc,
-                        state=copy.deepcopy(model.state_dict()))
+    # ---- Ablation: where does the signal actually come from? ------------------
+    # Same folds, same loop; only the feature columns fed to the model change.
+    #   structured = age, sex, is_child, inattentive + hyperactive T-scores (5)
+    #   notes      = the 768-d Bio_ClinicalBERT embedding of the clinical note
+    results = [("full (scores + demographics + notes)", full_accs, full_f1s)]
+    if args.ablation:
+        sd = dsm5_features.STRUCTURED_DIM
+        slices = [
+            ("scores + demographics only", X[:, :sd]),
+            ("clinical notes only (BERT)", X[:, sd:]),
+        ]
+        logger.info("\n=== Ablation | same folds, different feature subsets ===")
+        for name, X_sub in slices:
+            accs, f1s, _ = run_cv(
+                X_sub, y_t, dx, folds, args.epochs, args.lr, args.weight_decay,
+            )
+            results.append((name, accs, f1s))
+            logger.info("%-34s | accuracy=%.3f +/- %.3f | F1=%.3f +/- %.3f",
+                        name, np.mean(accs), np.std(accs), np.mean(f1s), np.std(f1s))
 
-    # ---- Summary --------------------------------------------------------------
-    logger.info("\n=== Cross-validation summary ===")
-    logger.info("Accuracy: %.3f +/- %.3f", np.mean(fold_accs), np.std(fold_accs))
-    logger.info("F1:       %.3f +/- %.3f", np.mean(fold_f1s), np.std(fold_f1s))
-    logger.info("Best fold: #%d (F1=%.3f, accuracy=%.3f)",
-                best["fold"], best["f1"], best["acc"])
+        # Side-by-side comparison table.
+        logger.info("\n=== Feature-set comparison (5-fold CV) ===")
+        logger.info("%-38s %-16s %-16s", "feature set", "accuracy", "F1")
+        for name, accs, f1s in results:
+            logger.info("%-38s %6.3f +/- %.3f   %6.3f +/- %.3f",
+                        name, np.mean(accs), np.std(accs), np.mean(f1s), np.std(f1s))
+        logger.info("Read this as: if 'notes only' rivals 'full', the synthetic "
+                    "notes are leaking the label; if 'full' <= 'scores only', the "
+                    "text adds no independent signal on this dataset.")
 
-    # ---- 9. Save the winning weights ------------------------------------------
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    torch.save(best["state"], args.output)
-    logger.info("\nSaved winning model weights -> %s", args.output)
+    # ---- 9. Save the winning FULL-model weights (what the API loads) ----------
+    _save_best(best, args.output)
+    logger.info("\nSaved winning FULL model weights -> %s", args.output)
     logger.info("DSM5_Analysis.py will load this automatically on the next call.")
     return 0
 
