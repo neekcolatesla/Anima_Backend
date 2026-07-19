@@ -198,7 +198,8 @@ Key options: `--folds` (default 5), `--epochs` (12), `--lr` (1e-3),
 (0.0, drop slices with too little tissue), `--max-slices` (0 = all selected;
 evenly sampled — the training analogue of serving `MRI_MAX_SLICES`), `--threshold`
 (0.5, the mean-probability cut-off), `--num-workers` (0 — safest on Windows),
-`--seed`, `--output`. Runs on GPU automatically if `torch.cuda.is_available()`.
+`--seed`, `--seeds` (comma-separated, e.g. `42,7,123` — cross-seed robustness),
+`--output`. Runs on GPU automatically if `torch.cuda.is_available()`.
 
 > **If you change `--central-frac` / `--min-foreground`, set the matching
 > `MRI_CENTRAL_FRAC` / `MRI_MIN_FOREGROUND` env vars for the API**, so it scores
@@ -209,6 +210,35 @@ gets diagnosed. Patient-level accuracy (mean-aggregated, matching serving) is th
 honest test score and the fold-selection metric; slice-level accuracy is a sanity
 signal underneath it.
 
+### Levers to lift off the baseline (generalisation, not capacity)
+
+When the model sits at chance, the fix is **not** a deeper network — on ~130
+patients extra capacity just memorises. The per-fold **train-vs-test gap** now
+printed (`train acc=… (gap ±…)`) tells you which regime you're in: a big positive
+gap = overfitting (going deeper would hurt); both low with a small gap = little
+learnable signal (depth won't help). The following levers improve generalisation
+without adding capacity:
+
+1. **Data augmentation** (`--augment`) — on-the-fly random rotation/shift/intensity
+   each epoch (train folds only), the *same* transform applied to both channels so
+   the anat/anat_gm pair stays registered. No left-right flip (brain laterality is
+   real signal). Tune with `--rotation` (10°), `--shift` (0.08), `--brightness` (0.15).
+2. **Input standardisation** — a learned `BatchNorm2d` over the 2 input channels,
+   baked into `MRICNN` itself (so serving needs no separate scaler).
+3. **Optimisation stability** — a cosine LR schedule (on by default; `--no-scheduler`
+   to disable) and gradient clipping (`--grad-clip`, default 1.0) to stop the
+   fold-collapse (F1 = 0) seen at a fixed LR.
+4. **Label-noise robustness** — `--label-smoothing` (e.g. 0.05) softens the per-slice
+   targets, since most slices carry no ADHD signal yet inherit the patient label.
+
+```powershell
+python train_mri.py --augment --label-smoothing 0.05 --epochs 40 --seeds 42,7,123
+```
+
+> **Retrain required:** adding the input `BatchNorm` changes the architecture, so
+> any `mri_cnn.pt` saved before this update won't load (the API just reports
+> `pending` until you retrain). Retraining regenerates a compatible file.
+
 ### Tuning — `--sweep`
 
 `--sweep` runs a small curated grid (epochs / lr / regularisation / input size)
@@ -216,6 +246,13 @@ over the **same** folds, prints a ranking by mean patient accuracy, and saves th
 best. It is **exploratory**: because the grid is scored on the same held-out folds
 it is chosen against, treat any "win" cautiously — a real gain should survive a
 fresh `--seed`, not just top the table.
+
+**`--seeds` — the honest robustness check.** When hand-tuning, the trap is that a
+config can top *one* fold partition by luck. Pass several seeds
+(`--seeds 42,7,123`) and the trainer runs the whole CV for each, then reports
+per-seed accuracy plus a cross-seed mean ± std. A tuning change is only real if it
+holds up **across** seeds — if the gain evaporates in the ± spread, it was
+fold-luck, not signal. Run candidate configs this way before believing them.
 
 ### On the expected result (be honest)
 

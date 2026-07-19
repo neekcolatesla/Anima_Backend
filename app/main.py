@@ -9,8 +9,9 @@ Server connection (via pyodbc) on startup, and wires in the feature routers:
     CSV_Ingestion   -> /api/ingest/csv, /api/ingest/dsm5-csv
     MRI_Ingestion   -> /api/ingest/mri
     DSM5_Assessment -> /api/dsm5       (questionnaire submit + clinician notes)
-    DSM5_Analysis   -> /api/analysis   (placeholder - text & demographic model)
-    MRI_Analysis    -> /api/analysis   (placeholder - image classification model)
+    DSM5_Analysis   -> /api/analysis/dsm5      (text & demographic model)
+    MRI_Analysis    -> /api/analysis/mri       (image classification model)
+    Combined_Analysis -> /api/analysis/combined (fuses NLP + MRI -> risk + subtype)
 """
 
 import os
@@ -31,6 +32,7 @@ from MRI_Ingestion import router as mri_ingestion_router
 from DSM5_Assessment import router as dsm5_assessment_router
 from DSM5_Analysis import router as dsm5_analysis_router
 from MRI_Analysis import router as mri_analysis_router
+from Combined_Analysis import router as combined_analysis_router
 
 # --- Logging -----------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
@@ -112,3 +114,4 @@ app.include_router(mri_ingestion_router)
 app.include_router(dsm5_assessment_router)
 app.include_router(dsm5_analysis_router)
 app.include_router(mri_analysis_router)
+app.include_router(combined_analysis_router)

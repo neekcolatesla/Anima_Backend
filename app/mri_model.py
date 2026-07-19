@@ -78,6 +78,11 @@ class MRICNN(nn.Module):
         self.dropout = float(dropout)
         self.channels = tuple(int(c) for c in channels)
 
+        # Learned input standardisation: a BatchNorm over the raw 2 input channels
+        # normalises anat / anat_gm intensities per channel from the data itself.
+        # It is baked into the saved weights, so serving needs no separate scaler.
+        self.input_norm = nn.BatchNorm2d(self.in_channels)
+
         # Stack the (few) convolutional blocks: in_channels -> 16 -> 32 -> 64.
         blocks = []
         prev = self.in_channels
@@ -94,6 +99,7 @@ class MRICNN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """(N, in_channels, H, W) -> (N,) ADHD-risk logits (pre-sigmoid)."""
+        x = self.input_norm(x)           # learned per-channel input standardisation
         x = self.features(x)
         x = self.pool(x)                 # (N, C, 1, 1)
         x = torch.flatten(x, 1)          # (N, C)

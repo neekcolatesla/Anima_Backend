@@ -49,6 +49,7 @@ Run (from the app/ folder, with SQL Server up + patients/MRI seeded, .env set):
 import os
 import sys
 import copy
+import random
 import argparse
 import logging
 from collections import Counter, defaultdict
@@ -166,25 +167,74 @@ def build_sample_index(records: list, central_frac, min_foreground, max_slices) 
 # =============================================================================
 # 3. Dataset: pair -> resize -> 2-channel tensor (lazy, from disk)
 # =============================================================================
-class SliceDataset(Dataset):
-    """A paired-slice dataset. Each item is a (2, H, W) tensor + label + patient."""
+# --- Lever 1: on-the-fly data augmentation (TRAIN ONLY) ----------------------
+# Small random transforms each epoch effectively enlarge the tiny dataset and
+# improve generalisation WITHOUT adding model capacity - the textbook small-data
+# regulariser. The SAME geometric transform is applied to both channels so the
+# anat / anat_gm pair stays registered. NB: no left-right flip - brain laterality
+# carries real (asymmetry) signal, so flipping could destroy it.
+def _augment_pair(a_img, g_img, aug: dict):
+    """Apply identical random rotation + translation to both channel images."""
+    rot = aug.get("rotation", 10.0)
+    shift = aug.get("shift", 0.08)
+    angle = random.uniform(-rot, rot)
+    a = a_img.rotate(angle, resample=Image.BILINEAR, fillcolor=0)
+    g = g_img.rotate(angle, resample=Image.BILINEAR, fillcolor=0)
+    if shift:
+        w, h = a.size
+        dx = random.uniform(-shift, shift) * w
+        dy = random.uniform(-shift, shift) * h
+        # affine translate with black fill (no wrap-around)
+        coeffs = (1, 0, -dx, 0, 1, -dy)
+        a = a.transform(a.size, Image.AFFINE, coeffs, resample=Image.BILINEAR, fillcolor=0)
+        g = g.transform(g.size, Image.AFFINE, coeffs, resample=Image.BILINEAR, fillcolor=0)
+    return a, g
 
-    def __init__(self, samples: list, input_size: int):
+
+def _intensity_jitter(arr_a, arr_g, aug: dict):
+    """Random brightness + contrast on each channel (same factors for the pair)."""
+    b = aug.get("brightness", 0.15)
+    c = aug.get("contrast", 0.15)
+    bf = 1.0 + random.uniform(-b, b)
+    cf = 1.0 + random.uniform(-c, c)
+
+    def jit(x):
+        m = float(x.mean())
+        return np.clip((x - m) * cf + m * bf, 0.0, 1.0)
+
+    return jit(arr_a), jit(arr_g)
+
+
+class SliceDataset(Dataset):
+    """A paired-slice dataset. Each item is a (2, H, W) tensor + label + patient.
+
+    With ``augment=True`` (train folds only) each item is randomly transformed on
+    access; eval folds use ``augment=False`` for a deterministic read.
+    """
+
+    def __init__(self, samples: list, input_size: int, augment: bool = False, aug: dict = None):
         self.samples = samples
         self.input_size = int(input_size)
+        self.augment = augment
+        self.aug = aug or {}
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _load(self, path: str) -> np.ndarray:
-        img = Image.open(path).convert("L").resize((self.input_size, self.input_size))
-        return np.asarray(img, dtype=np.float32) / 255.0
+    def _load_pil(self, path: str):
+        return Image.open(path).convert("L").resize((self.input_size, self.input_size))
 
     def __getitem__(self, i: int):
         a_path, g_path, label, patient_id = self.samples[i]
-        pair = np.stack([self._load(a_path), self._load(g_path)], axis=0)  # (2,H,W)
-        x = torch.from_numpy(pair)
-        return x, torch.tensor(float(label)), patient_id
+        a_img, g_img = self._load_pil(a_path), self._load_pil(g_path)
+        if self.augment:
+            a_img, g_img = _augment_pair(a_img, g_img, self.aug)
+        arr_a = np.asarray(a_img, dtype=np.float32) / 255.0
+        arr_g = np.asarray(g_img, dtype=np.float32) / 255.0
+        if self.augment:
+            arr_a, arr_g = _intensity_jitter(arr_a, arr_g, self.aug)
+        pair = np.stack([arr_a, arr_g], axis=0)                # (2,H,W)
+        return torch.from_numpy(pair), torch.tensor(float(label)), patient_id
 
 
 # =============================================================================
@@ -213,57 +263,28 @@ def _label_breakdown(labels) -> str:
 # =============================================================================
 # 5 + 6. Train / evaluate one fold
 # =============================================================================
-def _make_loader(samples, input_size, batch_size, shuffle, num_workers, device):
+def _make_loader(samples, input_size, batch_size, shuffle, num_workers, device,
+                 augment=False, aug=None):
     return DataLoader(
-        SliceDataset(samples, input_size),
+        SliceDataset(samples, input_size, augment=augment, aug=aug),
         batch_size=batch_size, shuffle=shuffle, num_workers=num_workers,
         pin_memory=(device.type == "cuda"), drop_last=False,
     )
 
 
-def train_one_fold(train_samples, test_samples, patient_labels, args, device):
-    """Train MRICNN on the fold's TRAIN slices, evaluate on its TEST slices.
+def _aug_config(args) -> dict:
+    return {"rotation": args.rotation, "shift": args.shift,
+            "brightness": args.brightness, "contrast": args.brightness}
 
-    Returns (model, metrics) where metrics = {slice_acc, patient_acc, patient_f1}.
-    The model outputs one logit per slice; patient-level metrics aggregate a
-    patient's slice probabilities by mean (exactly as MRI_Analysis.py serves).
-    """
-    model = mri_model.MRICNN(input_size=args.input_size, dropout=args.dropout).to(device)
 
-    # Class imbalance -> weight the positive (ADHD) class in the loss.
-    tr_labels = [s[2] for s in train_samples]
-    n_pos = float(sum(1 for l in tr_labels if l == 1))
-    n_neg = float(sum(1 for l in tr_labels if l == 0))
-    pos_weight = torch.tensor([n_neg / n_pos if n_pos > 0 else 1.0], device=device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
-                                 weight_decay=args.weight_decay)
-
-    train_loader = _make_loader(train_samples, args.input_size, args.batch_size,
-                                True, args.num_workers, device)
-
-    model.train()
-    for epoch in range(args.epochs):
-        running = 0.0
-        for x, y, _pid in train_loader:
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
-            logits = model(x)                     # (N,) per-slice logits
-            loss = criterion(logits, y)
-            loss.backward()
-            optimizer.step()
-            running += loss.item() * x.size(0)
-        if args.verbose_epochs:
-            logger.info("    epoch %2d/%d | train loss=%.4f",
-                        epoch + 1, args.epochs, running / max(len(train_samples), 1))
-
-    # ---- evaluate on the held-out test patients ----
-    test_loader = _make_loader(test_samples, args.input_size, args.batch_size,
-                               False, args.num_workers, device)
+def _evaluate(model, samples, patient_labels, args, device) -> dict:
+    """Score a model on a sample set (no augmentation). Returns slice/patient metrics."""
+    loader = _make_loader(samples, args.input_size, args.batch_size, False,
+                          args.num_workers, device, augment=False)
     model.eval()
     slice_true, slice_prob, slice_pid = [], [], []
     with torch.no_grad():
-        for x, y, pid in test_loader:
+        for x, y, pid in loader:
             probs = torch.sigmoid(model(x.to(device))).cpu().numpy()
             slice_prob.extend(probs.tolist())
             slice_true.extend(y.numpy().tolist())
@@ -285,8 +306,67 @@ def train_one_fold(train_samples, test_samples, patient_labels, args, device):
     patient_acc = accuracy_score(p_true, p_pred) if p_true else 0.0
     patient_f1 = f1_score(p_true, p_pred, zero_division=0) if p_true else 0.0
 
-    return model, {"slice_acc": slice_acc, "patient_acc": patient_acc,
-                   "patient_f1": patient_f1, "n_test_patients": len(p_true)}
+    return {"slice_acc": slice_acc, "patient_acc": patient_acc,
+            "patient_f1": patient_f1, "n_patients": len(p_true)}
+
+
+def train_one_fold(train_samples, test_samples, patient_labels, args, device):
+    """Train MRICNN on the fold's TRAIN slices, evaluate on its TEST slices.
+
+    Applies levers 1-4: augmentation (train loader), input standardisation (baked
+    into MRICNN), a cosine LR schedule + gradient clipping for stability (lever 3),
+    and label smoothing for robustness to per-slice label noise (lever 4).
+
+    Returns (model, metrics); metrics carries TEST slice/patient accuracy + F1 AND
+    the TRAIN patient accuracy, so the train-test gap (overfitting vs underfitting)
+    is visible per fold.
+    """
+    model = mri_model.MRICNN(input_size=args.input_size, dropout=args.dropout).to(device)
+
+    # Class imbalance -> weight the positive (ADHD) class in the loss.
+    tr_labels = [s[2] for s in train_samples]
+    n_pos = float(sum(1 for l in tr_labels if l == 1))
+    n_neg = float(sum(1 for l in tr_labels if l == 0))
+    pos_weight = torch.tensor([n_neg / n_pos if n_pos > 0 else 1.0], device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr,
+                                 weight_decay=args.weight_decay)
+    # Lever 3: cosine LR decay stabilises the fold-collapse we saw at fixed LR.
+    scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+                 if (not args.no_scheduler and args.epochs > 1) else None)
+
+    train_loader = _make_loader(train_samples, args.input_size, args.batch_size,
+                                True, args.num_workers, device,
+                                augment=args.augment, aug=_aug_config(args))
+    eps = float(args.label_smoothing)   # lever 4: soften noisy per-slice targets
+
+    model.train()
+    for epoch in range(args.epochs):
+        running = 0.0
+        for x, y, _pid in train_loader:
+            x, y = x.to(device), y.to(device)
+            if eps > 0:                          # smooth targets toward 0.5
+                y = y * (1.0 - eps) + 0.5 * eps
+            optimizer.zero_grad()
+            logits = model(x)                     # (N,) per-slice logits
+            loss = criterion(logits, y)
+            loss.backward()
+            if args.grad_clip > 0:                # lever 3: clip exploding grads
+                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            running += loss.item() * x.size(0)
+        if scheduler is not None:
+            scheduler.step()
+        if args.verbose_epochs:
+            logger.info("    epoch %2d/%d | train loss=%.4f | lr=%.2e",
+                        epoch + 1, args.epochs, running / max(len(train_samples), 1),
+                        optimizer.param_groups[0]["lr"])
+
+    test = _evaluate(model, test_samples, patient_labels, args, device)
+    train = _evaluate(model, train_samples, patient_labels, args, device)  # diagnostic
+    return model, {"slice_acc": test["slice_acc"], "patient_acc": test["patient_acc"],
+                   "patient_f1": test["patient_f1"], "n_test_patients": test["n_patients"],
+                   "train_patient_acc": train["patient_acc"]}
 
 
 # =============================================================================
@@ -298,7 +378,7 @@ def run_cv(samples, patient_labels, folds, args, device):
     for s in samples:
         by_patient_samples[s[3]].append(s)
 
-    slice_accs, patient_accs, patient_f1s = [], [], []
+    slice_accs, patient_accs, patient_f1s, train_accs = [], [], [], []
     best = {"patient_acc": -1.0, "patient_f1": -1.0, "fold": None,
             "state": None, "config": None}
 
@@ -314,13 +394,17 @@ def run_cv(samples, patient_labels, folds, args, device):
         slice_accs.append(m["slice_acc"])
         patient_accs.append(m["patient_acc"])
         patient_f1s.append(m["patient_f1"])
+        train_accs.append(m["train_patient_acc"])
 
+        # Diagnostic: train vs test patient accuracy. A large positive gap =
+        # overfitting (test would drop if we went DEEPER); both low + small gap =
+        # little learnable signal (depth won't help).
         logger.info(
-            "Fold %d/%d | train patients=%d slices=%d | test patients=%d slices=%d | "
-            "patient acc=%.3f  F1=%.3f | slice acc=%.3f",
-            fold, len(folds), len(train_pids), len(train_samples),
-            m["n_test_patients"], len(test_samples),
+            "Fold %d/%d | test patients=%d slices=%d | test acc=%.3f  F1=%.3f | "
+            "slice acc=%.3f | train acc=%.3f (gap %+.3f)",
+            fold, len(folds), m["n_test_patients"], len(test_samples),
             m["patient_acc"], m["patient_f1"], m["slice_acc"],
+            m["train_patient_acc"], m["train_patient_acc"] - m["patient_acc"],
         )
 
         # Best fold = best patient-level accuracy (deployment metric), tie -> F1.
@@ -332,6 +416,8 @@ def run_cv(samples, patient_labels, folds, args, device):
                         fold=fold, state=copy.deepcopy(model.state_dict()),
                         config=model.config())
 
+    # Attach the mean train accuracy so callers can report the train-test gap.
+    best["mean_train_acc"] = float(np.mean(train_accs)) if train_accs else 0.0
     return slice_accs, patient_accs, patient_f1s, best
 
 
@@ -350,10 +436,10 @@ def _save_best(best, path) -> None:
 # apples-to-apples. Deliberately small - each entry is a full K-fold CV run.
 SWEEP_GRID = [
     ("baseline",        {}),
-    ("more epochs",     {"epochs": 25}),
-    ("lower lr",        {"lr": 3e-4}),
-    ("stronger reg",    {"weight_decay": 1e-3, "dropout": 0.5}),
-    ("bigger input",    {"input_size": 160}),
+    ("augment",         {"augment": True, "epochs": 30}),
+    ("augment+smooth",  {"augment": True, "epochs": 30, "label_smoothing": 0.05}),
+    ("aug+lowerlr",     {"augment": True, "epochs": 40, "lr": 3e-4}),
+    ("stronger reg",    {"augment": True, "epochs": 30, "weight_decay": 1e-3, "dropout": 0.5}),
 ]
 
 
@@ -413,6 +499,23 @@ def main() -> int:
     ap.add_argument("--input-size", type=int, default=mri_model.INPUT_SIZE,
                     help="Square edge each slice is resized to.")
     ap.add_argument("--dropout", type=float, default=0.4, help="CNN dropout rate.")
+    # --- Lever 1: augmentation (train only) ---
+    ap.add_argument("--augment", action="store_true",
+                    help="Enable on-the-fly train augmentation (rotation/shift/intensity).")
+    ap.add_argument("--rotation", type=float, default=10.0,
+                    help="Augmentation: max rotation in degrees (+/-).")
+    ap.add_argument("--shift", type=float, default=0.08,
+                    help="Augmentation: max translation as a fraction of the image.")
+    ap.add_argument("--brightness", type=float, default=0.15,
+                    help="Augmentation: max brightness/contrast jitter (+/-).")
+    # --- Lever 3: optimisation stability ---
+    ap.add_argument("--grad-clip", type=float, default=1.0,
+                    help="Max gradient norm (0 = off). Stabilises training.")
+    ap.add_argument("--no-scheduler", action="store_true",
+                    help="Disable the cosine LR decay (on by default).")
+    # --- Lever 4: robustness to noisy per-slice labels ---
+    ap.add_argument("--label-smoothing", type=float, default=0.0,
+                    help="Soften targets toward 0.5 (e.g. 0.05) to resist slice-label noise.")
     ap.add_argument("--central-frac", type=float, default=0.6,
                     help="Keep the middle fraction of the axial stack (skip empty "
                          "edge slices). 1.0 = use the whole stack.")
@@ -428,6 +531,11 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=42, help="Random seed (reproducibility).")
     ap.add_argument("--output", default=DEFAULT_OUTPUT,
                     help="Where to save the winning fold's weights.")
+    ap.add_argument("--seeds", default=None,
+                    help="Comma-separated seeds (e.g. 42,7,123) to run the whole CV "
+                         "over several fold partitions and report cross-seed stability "
+                         "- the honest way to tell a real tuning gain from fold-luck. "
+                         "Overrides --seed.")
     ap.add_argument("--verbose-epochs", action="store_true",
                     help="Print per-epoch training loss.")
     ap.add_argument("--sweep", action="store_true",
@@ -436,8 +544,12 @@ def main() -> int:
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    random.seed(args.seed)          # augmentation uses the stdlib RNG
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
+    if args.augment:
+        logger.info("Augmentation ON: rotation=%.0f deg, shift=%.2f, intensity=%.2f",
+                    args.rotation, args.shift, args.brightness)
 
     # ---- 1 + 2. Load labels + current scan folders ----------------------------
     logger.info("Loading labelled patients with current MRI scans from SQL Server ...")
@@ -459,30 +571,54 @@ def main() -> int:
     if len(set(labels)) < 2:
         sys.exit("ERROR: need both ADHD and control patients to train a classifier.")
 
-    # ---- 4. Patient-level stratified folds ------------------------------------
-    folds = make_patient_folds(pids, labels, args.folds, args.seed)
-
-    # ---- Optional: exploratory hyperparameter sweep ---------------------------
+    # ---- Optional: exploratory hyperparameter sweep (single seed) -------------
     if args.sweep:
+        folds = make_patient_folds(pids, labels, args.folds, args.seed)
         return run_sweep(samples, patient_labels, folds, args, device)
 
-    # ---- 5-8. Cross-validated training ----------------------------------------
-    logger.info("\n=== MRICNN | %d-fold stratified CV (split BY PATIENT) ===", args.folds)
-    slice_accs, patient_accs, patient_f1s, best = run_cv(
-        samples, patient_labels, folds, args, device)
+    # ---- 4-9. Cross-validated training, over one or more seeds -----------------
+    seeds = [int(s) for s in str(args.seeds).split(",")] if args.seeds else [args.seed]
+    logger.info("\n=== MRICNN | %d-fold stratified CV (split BY PATIENT) | seeds=%s ===",
+                args.folds, seeds)
 
-    logger.info(
-        "\nSummary | patient acc=%.3f +/- %.3f | patient F1=%.3f +/- %.3f | "
-        "slice acc=%.3f +/- %.3f | best fold #%d (patient acc=%.3f)",
-        np.mean(patient_accs), np.std(patient_accs),
-        np.mean(patient_f1s), np.std(patient_f1s),
-        np.mean(slice_accs), np.std(slice_accs),
-        best["fold"], best["patient_acc"],
-    )
+    seed_means = []
+    overall_best = {"patient_acc": -1.0, "patient_f1": -1.0,
+                    "state": None, "config": None, "fold": None, "seed": None}
+    for sd in seeds:
+        folds = make_patient_folds(pids, labels, args.folds, sd)
+        if len(seeds) > 1:
+            logger.info("\n--- seed %d ---", sd)
+        slice_accs, patient_accs, patient_f1s, best = run_cv(
+            samples, patient_labels, folds, args, device)
+        logger.info(
+            "Seed %d summary | TEST patient acc=%.3f +/- %.3f | F1=%.3f +/- %.3f | "
+            "slice acc=%.3f +/- %.3f | TRAIN acc=%.3f (gap %+.3f) | best fold #%d (acc=%.3f)",
+            sd, np.mean(patient_accs), np.std(patient_accs),
+            np.mean(patient_f1s), np.std(patient_f1s),
+            np.mean(slice_accs), np.std(slice_accs),
+            best["mean_train_acc"], best["mean_train_acc"] - float(np.mean(patient_accs)),
+            best["fold"], best["patient_acc"],
+        )
+        seed_means.append(float(np.mean(patient_accs)))
+        if best["patient_acc"] > overall_best["patient_acc"]:
+            overall_best.update(patient_acc=best["patient_acc"],
+                                patient_f1=best["patient_f1"], state=best["state"],
+                                config=best["config"], fold=best["fold"], seed=sd)
 
-    # ---- 9. Save the winning fold's weights (what the API loads) --------------
-    _save_best(best, args.output)
-    logger.info("\nSaved winning MRICNN weights -> %s", args.output)
+    # Cross-seed robustness: a real tuning gain holds up here; fold-luck does not.
+    if len(seeds) > 1:
+        logger.info("\n=== Cross-seed robustness | %d seeds ===", len(seeds))
+        logger.info("per-seed mean patient acc: %s",
+                    "  ".join(f"{s}={m:.3f}" for s, m in zip(seeds, seed_means)))
+        logger.info("ACROSS SEEDS: patient acc = %.3f +/- %.3f  (read the +/- : a "
+                    "config whose gain vanishes here was fold-luck)",
+                    float(np.mean(seed_means)), float(np.std(seed_means)))
+
+    # ---- Save the winning fold's weights (what the API loads) -----------------
+    _save_best(overall_best, args.output)
+    logger.info("\nSaved winning MRICNN weights -> %s (seed %s, fold #%s, patient acc=%.3f)",
+                args.output, overall_best["seed"], overall_best["fold"],
+                overall_best["patient_acc"])
     logger.info("MRI_Analysis.py will load this automatically on the next call "
                 "(status flips from 'pending' to 'success').")
     return 0
