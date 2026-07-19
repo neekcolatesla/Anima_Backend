@@ -30,12 +30,12 @@ XAI / explainability is intentionally NOT included here yet.
 """
 
 import os
-import glob
 import logging
 
 from fastapi import APIRouter, HTTPException
 
 from database import get_connection
+import mri_slices
 
 logger = logging.getLogger("anima.analysis.mri")
 
@@ -51,64 +51,46 @@ MODEL_VERSION = os.getenv("MRI_MODEL_VERSION", "mri_cnn_v1")
 # Patient-level ADHD risk (0-100) at/above which the image model calls "ADHD".
 MRI_DIAGNOSIS_THRESHOLD = float(os.getenv("MRI_DIAGNOSIS_THRESHOLD", "50"))
 
+# Slice selection - MUST match train_mri.py so train and serve score the SAME
+# slices (no skew). Defaults mirror the trainer's defaults.
+MRI_CENTRAL_FRAC = float(os.getenv("MRI_CENTRAL_FRAC", "0.6"))
+MRI_MIN_FOREGROUND = float(os.getenv("MRI_MIN_FOREGROUND", "0.0"))
 # Cap on how many paired slices to score per patient (keeps serve-time inference
-# bounded; None = use every slice). Slices are evenly sampled across the stack.
-MRI_MAX_SLICES = int(os.getenv("MRI_MAX_SLICES", "0")) or None
+# bounded; 0 = use every selected slice). Slices are evenly sampled.
+MRI_MAX_SLICES = int(os.getenv("MRI_MAX_SLICES", "0"))
 
 
 # =============================================================================
 # Slice loading / batching helpers (pure image handling - no model here)
 # =============================================================================
-def _list_slices(directory: str) -> list:
-    """Sorted JPEG slice paths in a scan folder (numbered names preserve order)."""
-    if not directory or not os.path.isdir(directory):
-        return []
-    return sorted(glob.glob(os.path.join(directory, "*.jpg")))
-
-
-def _evenly_sample(items: list, k) -> list:
-    """Evenly sample at most ``k`` items across the list (order preserved)."""
-    if not k or len(items) <= k:
-        return items
-    step = len(items) / float(k)
-    return [items[int(i * step)] for i in range(k)]
-
-
 def _build_batch(anat_dir: str, anat_gm_dir: str, input_size: int):
     """Pair anat & anat_gm slices by index into a (N, 2, H, W) float tensor.
 
-    Channel 0 = anat (structural T1), channel 1 = anat_gm (grey matter). Slices
-    are paired positionally (both stacks are the same ordered axial series),
-    resized to ``input_size`` and scaled to [0, 1]. Returns None if either stack
-    is empty. Imports torch/PIL lazily so import failures degrade gracefully.
+    Channel 0 = anat (structural T1), channel 1 = anat_gm (grey matter). Slice
+    selection + positional pairing is delegated to the shared mri_slices module,
+    the SAME selector the trainer uses (central crop -> optional foreground filter
+    -> optional even subsample) so serving scores the same slices training saw.
+    Resized to ``input_size`` and scaled to [0, 1]. Returns None if empty.
+    Imports torch/PIL lazily so import failures degrade gracefully.
     """
     import numpy as np
     from PIL import Image
     import torch
 
-    anat = _list_slices(anat_dir)
-    anat_gm = _list_slices(anat_gm_dir)
-    if not anat or not anat_gm:
+    pairs = mri_slices.pair_slices(
+        anat_dir, anat_gm_dir,
+        central_frac=MRI_CENTRAL_FRAC, min_foreground=MRI_MIN_FOREGROUND,
+        max_slices=MRI_MAX_SLICES,
+    )
+    if not pairs:
         return None
-
-    n = min(len(anat), len(anat_gm))          # pair only where both stacks exist
-    anat, anat_gm = anat[:n], anat_gm[:n]
-    if MRI_MAX_SLICES:                         # optional even subsample of the pair list
-        idx = _evenly_sample(list(range(n)), MRI_MAX_SLICES)
-        anat = [anat[i] for i in idx]
-        anat_gm = [anat_gm[i] for i in idx]
 
     def _load(path):
         img = Image.open(path).convert("L").resize((input_size, input_size))
         return np.asarray(img, dtype=np.float32) / 255.0
 
-    chans = []
-    for a_path, g_path in zip(anat, anat_gm):
-        pair = np.stack([_load(a_path), _load(g_path)], axis=0)   # (2, H, W)
-        chans.append(pair)
-    if not chans:
-        return None
-    return torch.from_numpy(np.stack(chans, axis=0))              # (N, 2, H, W)
+    chans = [np.stack([_load(a), _load(g)], axis=0) for a, g in pairs]  # each (2,H,W)
+    return torch.from_numpy(np.stack(chans, axis=0))                    # (N, 2, H, W)
 
 
 # =============================================================================
