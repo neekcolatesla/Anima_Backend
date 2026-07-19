@@ -48,7 +48,7 @@ HF_HUB_OFFLINE=1
 TRANSFORMERS_OFFLINE=1
 ```
 
-With those flags set, `train_dsm5.py`, `test_analysis.py`, and the API load
+With those flags set, `train_dsm5.py`, `dsm5_smoketest.py`, and the API load
 Bio_ClinicalBERT straight from the local cache with **no network calls**. `.env`
 is read before transformers is imported, so the flags take effect automatically.
 
@@ -273,7 +273,7 @@ stays sealed for the moderated sessions.
 > scoring them again is optimistic by construction; the honest metrics are the
 > 5-fold CV numbers above and in `LIMITATIONS.md`.
 
-### 7a. Batch smoke test — `test_analysis.py`
+### 7a. Batch smoke test — `dsm5_smoketest.py`
 
 Runs every seeded patient through the real `DSM5_Analysis.analyze_patient()`
 path (the exact code the endpoint calls): loads the trained head, builds the
@@ -282,9 +282,9 @@ DB.
 
 ```powershell
 cd app
-python test_analysis.py              # all 129 seeded patients
-python test_analysis.py --limit 15   # quicker sample
-python test_analysis.py --patient 0010001   # a single patient
+python dsm5_smoketest.py              # all 129 seeded patients
+python dsm5_smoketest.py --limit 15   # quicker sample
+python dsm5_smoketest.py --patient 0010001   # a single patient
 ```
 
 What to check in the summary:
@@ -335,7 +335,7 @@ cleanest thing to show in a demo.
   once while online, then set `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1` in
   `.env` (see "Pre-downloading the model & offline mode" above).
 - **`No labelled patients` / count is 0** — the database isn't seeded; run
-  `python seed_db.py` first (see `README_DB_SETUP.md`).
+  `python seed_dsm5.py` first (see `README_DB_SETUP.md`).
 - **`OSError [Errno 22]` importing numpy/torch** — the `.venv` is inside OneDrive;
   recreate it on a local path such as `C:\venvs\anima` (see `README_DB_SETUP.md`).
 - **Slow first run** — expected; it's the one-time model download + embedding

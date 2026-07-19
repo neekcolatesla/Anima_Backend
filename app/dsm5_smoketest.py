@@ -17,9 +17,9 @@ sensible, non-crashing outputs through the real endpoint code?". The held-out
 130-222 block is never touched (it was never seeded).
 
 Run (from app/, DB up, .env set, trained head present):
-    python test_analysis.py            # all seeded patients
-    python test_analysis.py --limit 15 # first 15 only (faster)
-    python test_analysis.py --patient 0010001
+    python dsm5_smoketest.py            # all seeded patients
+    python dsm5_smoketest.py --limit 15 # first 15 only (faster)
+    python dsm5_smoketest.py --patient 0010001
 """
 
 import os
@@ -74,7 +74,7 @@ def main() -> int:
 
     patients = _fetch_seeded()
     if not patients:
-        sys.exit("No seeded patients with a confirmed diagnosis - run seed_db.py first.")
+        sys.exit("No seeded patients with a confirmed diagnosis - run seed_dsm5.py first.")
     if args.limit:
         patients = patients[: args.limit]
 

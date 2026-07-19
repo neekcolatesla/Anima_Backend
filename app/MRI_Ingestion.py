@@ -1,10 +1,21 @@
 """
-Anima - MRI ingestion pipeline.
+Anima - MRI ingestion pipeline (longitudinal).
 
-Owns the /api/ingest/mri endpoint: extracts a patient's MRI ZIP, normalises each
+Owns POST /api/ingest/mri. Extracts a patient's MRI ZIP, normalises each
 anatomical NIfTI (anat, anat_gm) to 0-255, writes the FULL axial slice stack as
-numbered JPEGs into /app/static/mri_images/<patient>/<scan>/, and records one MRI
-row per scan folder. (SysArchitecture: "api/ingest - Data Pipelines".)
+numbered JPEGs into /app/static/mri_images/<patient>/session_<n>/<scan>/, and
+records MRI rows under the longitudinal model:
+
+  * mode='replace'      (default) - CORRECTION of the current scan: the previous
+                        current row + its slice folder are removed and the new
+                        scan becomes current (same scan_session).
+  * mode='new_session'  - a genuinely NEW acquisition: the previous current scan
+                        is demoted to history (is_current = 0, folder kept) and
+                        the new scan becomes current with the next scan_session.
+
+The reusable core (ingest_patient_scans) is framework-agnostic and is called by
+BOTH this endpoint and the training seeder (seed_mri.py), so single-patient and
+bulk ingestion share one code path.
 """
 
 import os
@@ -15,7 +26,7 @@ import logging
 import tempfile
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 
 import pyodbc
 import numpy as np
@@ -29,12 +40,27 @@ logger = logging.getLogger("anima.ingest.mri")
 router = APIRouter(prefix="/api/ingest", tags=["Ingestion"])
 
 # Processed 2D JPEG slices are written to the dedicated Docker volume mounted at
-# /app/static/mri_images (see docker-compose.yml). Resolved relative to this
-# module so it matches main.py's static mount without a cross-import.
+# /app/static/mri_images (see docker-compose.yml).
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 MRI_IMAGES_DIR = os.path.join(STATIC_DIR, "mri_images")
 
+VALID_MODES = ("replace", "new_session")
 
+
+# =============================================================================
+# Framework-agnostic errors (so the seeder can use the core without FastAPI).
+# =============================================================================
+class PatientNotFoundError(Exception):
+    """Raised when the patient does not exist (MRI.patient_ID is an FK)."""
+
+
+class ScanNotFoundError(Exception):
+    """Raised when a required scan (anat / anat_gm) is not in the source."""
+
+
+# =============================================================================
+# Extraction + NIfTI helpers (unchanged, shared by all callers)
+# =============================================================================
 def _safe_extract(zip_path: str, dest: str) -> None:
     """Extract a ZIP, rejecting any member that would escape ``dest`` (zip-slip)."""
     dest_real = os.path.realpath(dest)
@@ -42,10 +68,8 @@ def _safe_extract(zip_path: str, dest: str) -> None:
         for member in zf.namelist():
             target = os.path.realpath(os.path.join(dest, member))
             if target != dest_real and not target.startswith(dest_real + os.sep):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unsafe path in archive: {member}",
-                )
+                raise HTTPException(status_code=400,
+                                    detail=f"Unsafe path in archive: {member}")
         zf.extractall(dest)
 
 
@@ -66,7 +90,8 @@ def _locate_nii(search_root: str, tmp_root: str, gm: bool) -> Optional[str]:
 
     Follows the documented pipeline first (nested *anat.nii.zip / *_anat_gm.nii.zip
     archives, which are extracted to reveal the raw .nii), then falls back to a
-    direct .nii.gz / .nii file (the layout of the sample archive).
+    direct .nii.gz / .nii file (the layout of the sample archive and the bulk
+    training folders).
     """
     if gm:  # grey-matter scan
         zip_patterns = ["*_anat_gm.nii.zip", "*anat_gm.nii.zip"]
@@ -87,19 +112,14 @@ def _locate_nii(search_root: str, tmp_root: str, gm: bool) -> Optional[str]:
         if inner:
             return inner
 
-    # 2) fallback: the .nii.gz / .nii is stored directly in the primary archive
+    # 2) fallback: the .nii.gz / .nii is stored directly in the source
     return _find_file(search_root, nii_patterns, must_not_contain=exclude)
 
 
 def _nii_to_slice_stack(nii_path: str, out_dir: str,
                         patient_id: str, scan_type: str) -> int:
-    """Normalise a NIfTI volume to 0-255 and save EVERY axial slice as a
-    numbered JPEG into ``out_dir``. Returns the number of slices written.
-
-    The full stack (not a single slice) preserves whole-brain coverage of ADHD
-    grey-matter biomarkers - prefrontal cortex, basal ganglia, cerebellum - which
-    are distributed through the volume, giving the ML model many data points per
-    patient and enabling the clinician-facing 3D/heat-map visualisation.
+    """Normalise a NIfTI volume to 0-255 and save EVERY axial slice as a numbered
+    JPEG into ``out_dir``. Returns the number of slices written.
     """
     img = nib.load(nii_path)
     data = np.asarray(img.get_fdata(), dtype=np.float64)
@@ -108,7 +128,6 @@ def _nii_to_slice_stack(nii_path: str, out_dir: str,
     if data.ndim != 3:
         raise ValueError(f"Expected a 3D volume, got shape {data.shape}.")
 
-    # Volume-wide 0-255 normalisation so intensities are consistent across slices.
     mn, mx = float(np.nanmin(data)), float(np.nanmax(data))
     span = mx - mn
     n_slices = data.shape[2]                  # axial slices along the last axis
@@ -124,19 +143,124 @@ def _nii_to_slice_stack(nii_path: str, out_dir: str,
     return n_slices
 
 
-@router.post("/mri")
-async def ingest_mri(file: UploadFile = File(...),
-                     conn: pyodbc.Connection = Depends(get_db)) -> dict:
-    """Ingest a patient's MRI archive: extract, normalise, slice the FULL stack.
+# =============================================================================
+# Longitudinal helpers
+# =============================================================================
+def _patient_exists(cursor, patient_id: str) -> bool:
+    cursor.execute("SELECT 1 FROM dbo.Patient WHERE patient_ID = ?;", patient_id)
+    return cursor.fetchone() is not None
 
-    The upload must be a ZIP named with the patient's 7-digit ID (e.g.
-    0010001.zip). Both anatomical scans (anat, anat_gm) are located and normalised
-    to 0-255, then EVERY axial slice is written as a numbered JPEG into a
-    patient/scan-specific folder: /app/static/mri_images/<patient>/<scan>/. One
-    MRI row is recorded per scan *folder* (file_path = the directory) so the
-    analysis engine can read the whole slice stack per scan.
+
+def _resolve_session(cursor, patient_id: str, mode: str) -> int:
+    """Pick the scan_session number for this ingestion.
+
+    First ingest -> 1. new_session -> max existing + 1. replace -> reuse the
+    patient's current session (the one being corrected).
     """
-    # Step 1-2: derive patient_ID from the ZIP filename (strip '.zip').
+    cursor.execute("SELECT MAX(scan_session) FROM dbo.MRI WHERE patient_ID = ?;", patient_id)
+    row = cursor.fetchone()
+    max_all = row[0] if row else None
+    if max_all is None:
+        return 1
+    if mode == "new_session":
+        return int(max_all) + 1
+    cursor.execute(
+        "SELECT MAX(scan_session) FROM dbo.MRI WHERE patient_ID = ? AND is_current = 1;",
+        patient_id,
+    )
+    cur = cursor.fetchone()[0]
+    return int(cur) if cur is not None else int(max_all)
+
+
+# =============================================================================
+# CORE - shared by the API endpoint and the training seeder
+# =============================================================================
+def ingest_patient_scans(cursor, patient_id: str, source_dir: str,
+                         mode: str = "replace", tmp_root: Optional[str] = None) -> list:
+    """Locate, slice, and record BOTH anatomical scans for one patient.
+
+    ``source_dir`` is a directory already containing the patient's scan files
+    (.nii / .nii.gz, optionally nested .zip). Does NOT commit - the caller owns
+    the transaction. Returns a list of dicts (scan_type, directory, slice_count,
+    scan_session). Raises PatientNotFoundError / ScanNotFoundError.
+    """
+    if mode not in VALID_MODES:
+        raise ValueError(f"mode must be one of {VALID_MODES}, got {mode!r}")
+    if not _patient_exists(cursor, patient_id):
+        raise PatientNotFoundError(patient_id)
+
+    tmp_root = tmp_root or tempfile.gettempdir()
+    session = _resolve_session(cursor, patient_id, mode)
+    results = []
+
+    for scan_type, is_gm in (("anat", False), ("anat_gm", True)):
+        nii_path = _locate_nii(source_dir, tmp_root, gm=is_gm)
+        if nii_path is None:
+            raise ScanNotFoundError(scan_type)
+
+        scan_dir = os.path.join(MRI_IMAGES_DIR, patient_id, f"session_{session}", scan_type)
+
+        # --- longitudinal DB handling for this scan_type ---
+        if mode == "replace":
+            # Correction: remove the current row(s) + their slice folders, unless
+            # the folder is the one we are about to (re)write.
+            cursor.execute(
+                "SELECT file_path FROM dbo.MRI "
+                "WHERE patient_ID = ? AND scan_type = ? AND is_current = 1;",
+                patient_id, scan_type,
+            )
+            for (old_path,) in cursor.fetchall():
+                if (old_path and os.path.isdir(old_path)
+                        and os.path.realpath(old_path) != os.path.realpath(scan_dir)):
+                    shutil.rmtree(old_path, ignore_errors=True)
+            cursor.execute(
+                "DELETE FROM dbo.MRI "
+                "WHERE patient_ID = ? AND scan_type = ? AND is_current = 1;",
+                patient_id, scan_type,
+            )
+        else:  # new_session: demote the old current to history (keep its folder)
+            cursor.execute(
+                "UPDATE dbo.MRI SET is_current = 0 "
+                "WHERE patient_ID = ? AND scan_type = ? AND is_current = 1;",
+                patient_id, scan_type,
+            )
+
+        # (Re)create a fresh target folder, then write the full slice stack.
+        if os.path.isdir(scan_dir):
+            shutil.rmtree(scan_dir)
+        os.makedirs(scan_dir, exist_ok=True)
+        slice_count = _nii_to_slice_stack(nii_path, scan_dir, patient_id, scan_type)
+
+        cursor.execute(
+            """
+            INSERT INTO dbo.MRI
+                (patient_ID, scan_type, file_path, slice_count, is_current, scan_session)
+            VALUES (?, ?, ?, ?, 1, ?);
+            """,
+            patient_id, scan_type, os.path.abspath(scan_dir), slice_count, session,
+        )
+        results.append({"scan_type": scan_type, "directory": os.path.abspath(scan_dir),
+                        "slice_count": slice_count, "scan_session": session})
+
+    return results
+
+
+# =============================================================================
+# API endpoint - single patient
+# =============================================================================
+@router.post("/mri")
+async def ingest_mri(
+    file: UploadFile = File(...),
+    mode: str = Query("replace", pattern="^(replace|new_session)$",
+                      description="replace = correct the current scan; "
+                                  "new_session = keep the old scan as history."),
+    conn: pyodbc.Connection = Depends(get_db),
+) -> dict:
+    """Ingest one patient's MRI archive (ZIP named with the 7-digit patient ID).
+
+    The upload is streamed to disk (not buffered in RAM), extracted, and passed to
+    the shared core. ``mode`` chooses the longitudinal behaviour (see module docs).
+    """
     filename = os.path.basename(file.filename or "")
     if not filename.lower().endswith(".zip"):
         raise HTTPException(
@@ -146,28 +270,20 @@ async def ingest_mri(file: UploadFile = File(...),
         )
     patient_id = filename[:-4]
 
-    raw = await file.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
-    # Verify the patient exists BEFORE processing (MRI.patient_ID is a FK to
-    # Patient) - avoids writing orphan JPEGs for an unknown patient.
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM dbo.Patient WHERE patient_ID = ?;", patient_id)
-    if cursor.fetchone() is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Patient '{patient_id}' not found. Ingest demographics first.",
-        )
-
     os.makedirs(MRI_IMAGES_DIR, exist_ok=True)
-    results = []  # (scan_type, absolute_dir_path, slice_count)
+    cursor = conn.cursor()
 
-    # Step 3-5 + image processing inside a self-cleaning temp directory.
     with tempfile.TemporaryDirectory() as tmp:
+        # Stream the upload to disk in chunks (avoids holding ~14 MB+ in memory).
         primary_path = os.path.join(tmp, filename)
         with open(primary_path, "wb") as fh:
-            fh.write(raw)
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+        if os.path.getsize(primary_path) == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
         extract_root = os.path.join(tmp, "extracted")
         os.makedirs(extract_root, exist_ok=True)
@@ -177,66 +293,40 @@ async def ingest_mri(file: UploadFile = File(...),
             raise HTTPException(status_code=400,
                                 detail="Uploaded file is not a valid ZIP archive.")
 
-        for scan_type, is_gm in (("anat", False), ("anat_gm", True)):
-            nii_path = _locate_nii(extract_root, tmp, gm=is_gm)
-            if nii_path is None:
-                pat = "*_anat_gm.nii" if is_gm else "*anat.nii"
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Could not find the {scan_type} scan ({pat}[.zip/.gz]) "
-                           "in the archive.",
-                )
-
-            # Patient- and scan-specific folder; wiped first so a re-ingest never
-            # mixes fresh slices with stale ones from a previous run.
-            scan_dir = os.path.join(MRI_IMAGES_DIR, patient_id, scan_type)
-            if os.path.isdir(scan_dir):
-                shutil.rmtree(scan_dir)
-            os.makedirs(scan_dir, exist_ok=True)
-
-            try:
-                slice_count = _nii_to_slice_stack(nii_path, scan_dir,
-                                                  patient_id, scan_type)
-            except Exception as exc:
-                logger.exception("NIfTI->JPEG stack conversion failed.")
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Failed to process {scan_type} scan: {exc}",
-                )
-            results.append((scan_type, os.path.abspath(scan_dir), slice_count))
-
-    total_slices = sum(count for _s, _d, count in results)
-
-    # DB: store ONE row per scan *folder* (file_path = the directory), not per
-    # image. Delete-then-insert makes re-ingesting a patient's MRI idempotent.
-    try:
-        cursor.execute("DELETE FROM dbo.MRI WHERE patient_ID = ?;", patient_id)
-        for scan_type, dir_path, slice_count in results:
-            cursor.execute(
-                """
-                INSERT INTO dbo.MRI (patient_ID, scan_type, file_path, slice_count)
-                VALUES (?, ?, ?, ?);
-                """,
-                patient_id, scan_type, dir_path, slice_count,
+        try:
+            results = ingest_patient_scans(cursor, patient_id, extract_root,
+                                           mode=mode, tmp_root=tmp)
+            conn.commit()
+        except PatientNotFoundError:
+            conn.rollback()
+            raise HTTPException(
+                status_code=404,
+                detail=f"Patient '{patient_id}' not found. Ingest demographics first.",
             )
-        conn.commit()
-    except HTTPException:
-        conn.rollback()
-        raise
-    except pyodbc.Error as exc:
-        conn.rollback()
-        logger.exception("MRI ingestion DB error.")
-        raise HTTPException(status_code=400, detail=f"MRI ingestion failed: {exc}")
+        except ScanNotFoundError as exc:
+            conn.rollback()
+            raise HTTPException(
+                status_code=422,
+                detail=f"Could not find the {exc} scan in the archive.",
+            )
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception as exc:
+            conn.rollback()
+            logger.exception("MRI ingestion failed.")
+            raise HTTPException(status_code=422, detail=f"MRI ingestion failed: {exc}")
 
+    total_slices = sum(r["slice_count"] for r in results)
+    session = results[0]["scan_session"] if results else None
     return {
         "status": "success",
-        "message": (f"Stored {total_slices} MRI slice image(s) across "
-                    f"{len(results)} scan folder(s) for patient {patient_id}."),
         "patient_ID": patient_id,
-        "scans": [
-            {"scan_type": s, "directory": d, "slice_count": c}
-            for s, d, c in results
-        ],
-        "stored_count": len(results),
+        "mode": mode,
+        "scan_session": session,
+        "scans": results,
         "total_slices": total_slices,
+        "message": (f"Stored {total_slices} MRI slice image(s) across "
+                    f"{len(results)} scan(s) for patient {patient_id} "
+                    f"(session {session}, mode={mode})."),
     }

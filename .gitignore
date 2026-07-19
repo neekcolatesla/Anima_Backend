@@ -10,7 +10,15 @@ venv/
 # not via git. Place them in data/ before running the seeder.
 *.csv
 
-# Processed MRI output (generated into the Docker volume)
+# Raw MRI scans: large NIfTI volumes + archives (ADHD-200, CC BY-NC). Kept OUT of
+# the public repo like the CSVs - drop them in a local folder (e.g. data/mri/) and
+# point seed_mri.py --mri-dir at it. These are never committed.
+*.nii
+*.nii.gz
+*.zip
+data/mri/
+
+# Processed MRI output (JPEG slices; generated into the Docker volume)
 app/static/mri_images/
 
 # Python cache
