@@ -79,7 +79,7 @@ Practical implications:
 - To point at a different model, set `CLINICAL_BERT_MODEL` and rebuild with
   `--build` so the new model is baked in.
 
-See `README_TRAINING.md` → "Pre-downloading the model & offline mode" for the
+See `README_DSM5.md` → "Pre-downloading the model & offline mode" for the
 host (`.venv`) equivalent used by the training and test scripts.
 
 ---
@@ -100,9 +100,9 @@ Anima_Backend/
 │   ├── DSM5_Analysis.py
 │   ├── dsm5_features.py       # shared BERT + demographic feature builder
 │   ├── dsm5_model.py          # trained head architecture (shared train/serve)
-│   ├── train_dsm5.py          # DSM-5 model training (see README_TRAINING.md)
-│   ├── test_analysis.py       # smoke-test the analysis endpoint
-│   ├── seed_db.py             # <- schema + demographics/DSM-5 data
+│   ├── train_dsm5.py          # DSM-5 model training (see README_DSM5.md)
+│   ├── dsm5_smoketest.py       # smoke-test the analysis endpoint
+│   ├── seed_dsm5.py             # <- schema + demographics/DSM-5 data
 │   ├── seed_mri.py            # <- bulk-load MRI training scans (§4a)
 │   └── models/
 │       └── dsm5_head.pt       # trained weights (ships with the folder)
@@ -120,7 +120,7 @@ Anima_Backend/
 ├── Dockerfile                     # bakes Bio_ClinicalBERT for offline runtime
 ├── requirements.txt
 ├── README_DB_SETUP.md
-├── README_TRAINING.md
+├── README_DSM5.md
 ├── LIMITATIONS.md
 ├── .env                 # your local secrets (git-ignored)
 └── .env.example
@@ -178,7 +178,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ```
 
 `.env` lives at the repo root. `database.py` finds it automatically even when you
-run `seed_db.py` from inside `app\`, so you don't need a second copy.
+run `seed_dsm5.py` from inside `app\`, so you don't need a second copy.
 
 ---
 
@@ -204,7 +204,7 @@ From the `app` folder, with the `.venv` activated:
 
 ```powershell
 cd app
-python seed_db.py
+python seed_dsm5.py
 ```
 
 This runs `db\init_db.sql` to create the tables + seed admin (executed batch by
@@ -228,7 +228,7 @@ Seed complete.
 
 It's idempotent — safe to re-run (`init_db.sql` only creates missing objects,
 existing patients are skipped, assessments are enriched in place). **Re-running
-also applies schema migrations**: after any `init_db.sql` change, `seed_db.py`
+also applies schema migrations**: after any `init_db.sql` change, `seed_dsm5.py`
 brings your existing database up to date (adding new columns/tables), so the
 batch count rises — e.g. the longitudinal-MRI + audit changes take it from 15 to
 **22 batches**. Run it once after pulling schema changes and before `seed_mri`.
@@ -237,7 +237,7 @@ To seed a different set (e.g. the full set, or the held-out block), point it at
 other files:
 
 ```powershell
-python seed_db.py --phenotypic ..\data\NYU_Athena_Phenotypic_All.csv --dsm5 ..\data\DSM5_data.csv
+python seed_dsm5.py --phenotypic ..\data\NYU_Athena_Phenotypic_All.csv --dsm5 ..\data\DSM5_data.csv
 ```
 
 Useful flags:
@@ -257,7 +257,7 @@ core as the live `POST /api/ingest/mri` endpoint so seeded rows match a real
 ingest.
 
 **Prerequisites:** the database is up (§3), patients are already seeded (§4), the
-schema migration has been applied (re-run `seed_db.py` so the `is_current` /
+schema migration has been applied (re-run `seed_dsm5.py` so the `is_current` /
 `scan_session` columns exist), and the scans are on disk as per-patient folders:
 
 ```
@@ -337,7 +337,7 @@ The text model uses Bio_ClinicalBERT, which downloads (~440 MB) from Hugging Fac
 on first use. To avoid depending on the network at startup (recommended for demos
 / locked-down machines), pre-download it once with `python scripts/predownload_model.py`
 and set `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1` in `.env`. See
-`README_TRAINING.md` → "Pre-downloading the model & offline mode" for details.
+`README_DSM5.md` → "Pre-downloading the model & offline mode" for details.
 
 ---
 
@@ -358,7 +358,7 @@ api image (which already bundles the driver). Set `DB_HOST=db` in `.env` first,
 then mount the repo so the container can see the CSVs + schema script:
 
 ```powershell
-docker compose run --rm -v ${PWD}:/repo -w /app api python seed_db.py `
+docker compose run --rm -v ${PWD}:/repo -w /app api python seed_dsm5.py `
   --phenotypic /repo/data/NYU_Athena_Phenotypic_1-129.csv `
   --dsm5 /repo/data/DSM5_data_1-129.csv `
   --init-sql /repo/db/init_db.sql

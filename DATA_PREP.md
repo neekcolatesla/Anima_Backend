@@ -99,6 +99,19 @@ already in place**: each `MRI` row links by `patient_ID` to
 1 = combined, 2 = hyperactive, 3 = inattentive) — so the image classifier trains
 on the same binary (ADHD vs control) or multiclass target as the text model.
 
+### 2.4 From slices to a prediction (serving contract)
+
+The prepared slices feed the image classifier documented in
+`README_MRI.md`. At inference the engine (`app/MRI_Analysis.py`) reads a
+patient's **current** `anat` + `anat_gm` folders, **pairs** the two stacks
+positionally, resizes each slice to 128×128, scales to `[0, 1]`, and stacks them
+as a **2-channel** image (channel 0 = anat, channel 1 = anat_gm) for the shallow
+CNN (`app/mri_model.py`). This is why both scans are kept and sliced identically
+in §2.1–2.2: they must line up index-for-index so each pixel carries both the
+structural and grey-matter signal. Per-slice ADHD probabilities are then averaged
+into one patient-level risk — so the whole-brain slice stack (not a single slice)
+is what the classifier consumes.
+
 ---
 
 ## 3. NLP / DSM-5 text & demographic data preparation
@@ -146,7 +159,7 @@ scores. A TF-IDF probe of the corrected notes fell from perfect separation to
 ### 3.4 Split and database ingestion
 
 The generated files are split into the **seed set** (`*_1-129.csv`) and the
-**held-out set** (`*_130-222.csv`, kept off the repo). `app/seed_db.py` loads the
+**held-out set** (`*_130-222.csv`, kept off the repo). `app/seed_dsm5.py` loads the
 seed set with the same cleaning/encryption helpers the API uses:
 
 - phenotypic CSV → `Patient` (demographics; names encrypted) + `DSM5_Assessment`

@@ -95,7 +95,7 @@ def main() -> int:
                             patient_id, sc, len(results), results[0]["scan_session"])
             except PatientNotFoundError:
                 conn.rollback()
-                logger.warning("  skip %s: patient not in DB (run seed_db.py first)", patient_id)
+                logger.warning("  skip %s: patient not in DB (run seed_dsm5.py first)", patient_id)
                 skipped += 1
             except ScanNotFoundError as exc:
                 conn.rollback()

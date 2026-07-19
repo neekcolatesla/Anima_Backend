@@ -15,7 +15,7 @@ existing patients are skipped and existing assessments are enriched in place
 (init_db.sql is itself idempotent, so re-running the schema step is safe too).
 
 Run (from the app/ folder, with the SQL Server container up and .env set):
-    python seed_db.py
+    python seed_dsm5.py
 """
 
 import os
@@ -35,14 +35,14 @@ from DSM5_Assessment import latest_assessment_id, patient_exists
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("anima.seed")
 
-# seed_db.py lives in app/, so the repo root is two levels up.
+# seed_dsm5.py lives in app/, so the repo root is two levels up.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Schema + seed-admin script (single source of truth; no init_db.py).
 DEFAULT_INIT_SQL = os.path.join(_REPO_ROOT, "db", "init_db.sql")
 
 # The data is pre-split into a "seed" set (patients 1-129) and a held-out set
-# (130-222) that gets ingested live during the moderated sessions. seed_db loads
+# (130-222) that gets ingested live during the moderated sessions. seed_dsm5 loads
 # the 1-129 files by default; point --phenotypic / --dsm5 at other files (e.g.
 # the *_130-222 or *_All versions) to seed a different set.
 DEFAULT_PHENOTYPIC = os.path.join(_REPO_ROOT, "data", "NYU_Athena_Phenotypic_1-129.csv")

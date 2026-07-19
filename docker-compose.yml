@@ -27,7 +27,7 @@ services:
 
   # ---------------------------------------------------------------------------
   # Seed - one-shot: create schema + seed admin (init_db.sql) and load the
-  # 1-129 patients, then EXIT. Idempotent (seed_db.py skips existing patients),
+  # 1-129 patients, then EXIT. Idempotent (seed_dsm5.py skips existing patients),
   # so it is safe to run on every `docker compose up`. Runs only after the DB is
   # healthy; the API waits for this to complete before starting.
   # ---------------------------------------------------------------------------
@@ -50,10 +50,10 @@ services:
       FERNET_KEY: ${FERNET_KEY}
     volumes:
       - ./app:/app
-      # seed_db.py resolves its defaults to /data and /db inside the container
+      # seed_dsm5.py resolves its defaults to /data and /db inside the container
       - ./data:/data
       - ./db:/db
-    command: ["python", "seed_db.py"]
+    command: ["python", "seed_dsm5.py"]
     restart: "no"
     networks:
       - anima_net
