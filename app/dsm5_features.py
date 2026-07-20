@@ -128,6 +128,52 @@ def embed_notes(notes: Union[str, Sequence[Optional[str]]]) -> torch.Tensor:
     return embeddings[0] if single else embeddings
 
 
+@torch.no_grad()
+def embed_note_tokens(note: Optional[str]):
+    """Per-word contextual vectors for a note (for word-level explanations).
+
+    Returns ``(words, word_vectors)`` where ``words`` is a list of the note's
+    words and ``word_vectors`` is a (num_words, 768) tensor - each row is the SUM
+    of that word's sub-token hidden states. Since the note embedding is a mean of
+    these same token states, a dot product of each word vector with the model's
+    note weight gives how hard that word pushed the score. Empty note -> ([], 0x768).
+    """
+    if not note or not str(note).strip():
+        return [], torch.zeros((0, EMBED_DIM))
+
+    tokenizer, model, device = _load_model()
+    enc = tokenizer(str(note), truncation=True, max_length=MAX_TOKENS,
+                    return_offsets_mapping=True, return_tensors="pt")
+    offsets = enc.pop("offset_mapping")[0].tolist()   # char spans per token
+    word_ids = enc.word_ids(0)                        # which word each token belongs to
+    enc = enc.to(device)
+    hidden = model(**enc).last_hidden_state[0].cpu()  # (T, 768)
+
+    # Group sub-tokens by their source word (skip special tokens where word_id is None).
+    groups = {}
+    order = []
+    for ti, wid in enumerate(word_ids):
+        if wid is None:
+            continue
+        if wid not in groups:
+            groups[wid] = []
+            order.append(wid)
+        groups[wid].append(ti)
+
+    words, vectors = [], []
+    text = str(note)
+    for wid in order:
+        idxs = groups[wid]
+        start, end = offsets[idxs[0]][0], offsets[idxs[-1]][1]
+        word = text[start:end]
+        if not word.strip():
+            continue
+        words.append(word)
+        vectors.append(hidden[idxs].sum(dim=0))
+    word_vectors = torch.stack(vectors) if vectors else torch.zeros((0, EMBED_DIM))
+    return words, word_vectors
+
+
 def build_structured(age, biological_sex, is_child,
                      inattentive_score, hyperactive_score) -> torch.Tensor:
     """Assemble the 5-d structured feature vector in the fixed feature order."""

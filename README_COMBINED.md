@@ -118,6 +118,71 @@ python combined_smoketest.py --limit 5 --as A000001        # write side (+ creat
 python combined_read_smoketest.py --patient 0010001         # read side (+ RBAC denial check)
 ```
 
+## Explainability (XAI) — the `explanation` block
+
+Every successful analysis now carries an `"explanation"` object so the frontend can
+show **why** the model decided as it did. The DSM-5 endpoint returns `text_model`;
+the Combined endpoint returns both `text_model` and `mri_model`; the MRI endpoint
+returns `mri_model`.
+
+```jsonc
+"explanation": {
+  "text_model": {
+    "method": "model",
+    "summary": "The biggest factor was 'Hyperactive score' (38.1% toward ADHD). Notable words in the note: restless, distracted.",
+    "feature_importance": [        // bind to a bar chart
+      { "feature": "Hyperactive score", "impact_percent": 38.1, "direction": "toward ADHD" },
+      { "feature": "Clinical notes",    "impact_percent": 22.4, "direction": "toward ADHD" },
+      { "feature": "Inattentive score", "impact_percent": 19.0, "direction": "toward ADHD" }
+      // ... Age, Biological sex, Child
+    ],
+    "influential_words": [         // bind to a gallery / list
+      { "word": "restless",   "push": 100.0, "direction": "toward ADHD" },
+      { "word": "focused",    "push": -61.0, "direction": "toward control" }
+    ]
+  },
+  "mri_model": {
+    "available": true,
+    "top_slice_index": 94,         // the single highest-risk brain slice
+    "heatmap_image": "data:image/png;base64,iVBORw0KGgo...",   // set as an Image control's Image
+    "summary": "The image model's decision was driven most by brain slice 94. Red = looked hardest, blue = ignored."
+  }
+}
+```
+
+What each piece is, in plain terms:
+
+- **`feature_importance`** — how much each DSM-5 score / demographic (plus the note
+  as one bar) pushed the prediction, as percentages that sum to 100. Because the
+  text head is a linear model, these are the model's *exact* contributions, not an
+  approximation. `direction` says which way it pushed.
+- **`influential_words`** — the note's most impactful words. `push` is that word's
+  pull on the score relative to the strongest word (−100…100); positive = toward
+  ADHD. Built by dotting each word's language-model vector with the model's note
+  weight.
+- **`mri_model.heatmap_image`** — a Grad-CAM overlay on the highest-risk slice: the
+  script finds the slice with the top ADHD score, traces which pixels drove it, and
+  paints a red(=looked hard)/blue(=ignored) map over the brain. It's a base64 PNG
+  **data URI**, so in Power Apps you can bind an Image control's `Image` property
+  straight to it — no file download needed.
+
+**Power Apps binding sketch:**
+
+- bar chart items → `response.explanation.text_model.feature_importance`
+  (X = `feature`, Y = `impact_percent`)
+- influential-words gallery → `response.explanation.text_model.influential_words`
+- brain heatmap → `Image1.Image = response.explanation.mri_model.heatmap_image`
+
+**Graceful degradation.** If the trained text head can't load, `text_model.method`
+is `"heuristic"` (feature importance from the subscale scores, no word list). If the
+MRI model is untrained or the patient has no scans, `mri_model` is
+`{ "available": false, "reason": "pending" | "no_scans" }` and there's no heatmap —
+the rest of the explanation is unaffected.
+
+> Note: this release also fixed the DSM-5 head loader (it now uses
+> `dsm5_model.load_head`, so scoring + explanations use the **real trained model**;
+> previously a load bug silently fell back to the score-only heuristic).
+
 ## Where the accuracy comes from
 
 The DSM-5/demographic model is the strong channel (scores-only cross-validated
