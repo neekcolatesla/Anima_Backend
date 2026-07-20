@@ -6,7 +6,11 @@ ADHD decision for the clinician. It fuses the **text & demographic model**
 single `final_combined_score` + subtype, and records every run in an append-only
 audit table.
 
-`app/Combined_Analysis.py` → `POST /api/analysis/combined/{patient_id}`.
+`app/Combined_Analysis.py` → `POST /api/analysis/combined/{patient_id}?requester_user_id=...`.
+
+The trigger is **single-patient** (one analysis at a time — no batch), RBAC-gated
+by the same rules as the read side below, and records the requester as
+`created_by` on the audit row.
 
 ## What one call does
 
@@ -25,7 +29,8 @@ audit table.
 5. **Writes one `Analysis_Result` row** — the authoritative, never-updated audit
    trail for the Admin accountability persona. Each run appends a new row (patient,
    assessment_ID, MRI_ID, both component scores, the combined score, subtype,
-   `model_version`, `created_by`); previous runs are preserved.
+   `model_version`, and `created_by` = the `requester_user_id` that triggered it);
+   previous runs are preserved.
 
 ## Graceful degradation
 
@@ -67,10 +72,50 @@ or `no_scans`, and `weighting` reads `nlp=1.0 (mri unavailable)`.
 | `COMBINED_DIAGNOSIS_THRESHOLD` | `50` | combined risk (0–100) at/above which → `ADHD` |
 | `COMBINED_MODEL_VERSION` | `combined_v1` | version tag recorded on each audit row |
 
+## Retrieval (read side) — the clinician view & Admin audit trail
+
+Two RBAC-gated GET endpoints read back the append-only `Analysis_Result` table
+(the write side is the POST above). Like the rest of the API, the caller passes
+`requester_user_id` as a query parameter.
+
+| Endpoint | Returns |
+|----------|---------|
+| `GET /api/analysis/results/{patient_id}` | the patient's **latest** combined result |
+| `GET /api/analysis/results/{patient_id}/history?limit=50` | the patient's **full history**, newest first (the audit trail) |
+
+**Access control** (enforced by `_authorize_patient_access`, and this also protects
+child records — a child has no login, so the only ways in are Admin, its assigned
+clinician, or its linked guardian):
+
+| Role | May read |
+|------|----------|
+| **Admin** | any patient (the accountability / audit persona) |
+| **Clinician** | only patients assigned via `Clinician_Patient_Assignment` |
+| **Guardian** | only their linked child (`Patient.guardian_ID`) |
+| **Patient** | only themselves (`Patient.user_ID`) |
+
+Denials return `403`; an unknown requester `401`; a patient with no results `404`.
+
+> The seeded database ships an Admin (so the audit view works out of the box) but
+> **no clinician assignments** — grant one to test the clinician path, e.g.
+> `INSERT INTO dbo.Clinician_Patient_Assignment (clinician_ID, patient_ID) VALUES ('0010005', '0010001');`
+
 ## Try it
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/analysis/combined/0010001"
+# Run the analysis (RBAC-gated; records created_by = requester)
+Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/analysis/combined/0010001?requester_user_id=A000001"
+
+# Read it back (Admin sees any patient)
+Invoke-RestMethod -Uri "http://localhost:8000/api/analysis/results/0010001?requester_user_id=A000001"
+Invoke-RestMethod -Uri "http://localhost:8000/api/analysis/results/0010001/history?requester_user_id=A000001"
+```
+
+Or validate both sides against the DB without the server running:
+
+```powershell
+python combined_smoketest.py --limit 5 --as A000001        # write side (+ created_by)
+python combined_read_smoketest.py --patient 0010001         # read side (+ RBAC denial check)
 ```
 
 ## Where the accuracy comes from

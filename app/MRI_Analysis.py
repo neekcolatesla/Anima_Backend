@@ -130,8 +130,14 @@ def _score_with_cnn(anat_dir: str, anat_gm_dir: str):
             "confidence": round(min(max(confidence, 0.0), 100.0), 2),
             "slices_scored": int(batch.shape[0]),
         }
-    except Exception:
-        logger.exception("Trained-CNN scoring failed; reporting pending result.")
+    except Exception as exc:
+        # Expected when the on-disk weights don't match the current architecture
+        # (e.g. after a model change) or the file is unreadable. Degrade cleanly to
+        # "pending" with a concise, actionable line - not an alarming stack trace.
+        logger.warning(
+            "MRI weights at %s could not be loaded (%s); returning 'pending'. "
+            "If the model architecture changed, retrain with train_mri.py to "
+            "regenerate a compatible mri_cnn.pt.", CNN_PATH, exc)
         return None
 
 
