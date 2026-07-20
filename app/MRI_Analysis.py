@@ -63,15 +63,13 @@ MRI_MAX_SLICES = int(os.getenv("MRI_MAX_SLICES", "0"))
 # =============================================================================
 # Slice loading / batching helpers (pure image handling - no model here)
 # =============================================================================
-def _build_batch(anat_dir: str, anat_gm_dir: str, input_size: int):
-    """Pair anat & anat_gm slices by index into a (N, 2, H, W) float tensor.
+def _load_pairs_batch(anat_dir: str, anat_gm_dir: str, input_size: int):
+    """Select + pair slices (shared selector) and load them as a (N,2,H,W) tensor.
 
-    Channel 0 = anat (structural T1), channel 1 = anat_gm (grey matter). Slice
-    selection + positional pairing is delegated to the shared mri_slices module,
-    the SAME selector the trainer uses (central crop -> optional foreground filter
-    -> optional even subsample) so serving scores the same slices training saw.
-    Resized to ``input_size`` and scaled to [0, 1]. Returns None if empty.
-    Imports torch/PIL lazily so import failures degrade gracefully.
+    Channel 0 = anat (structural T1), channel 1 = anat_gm (grey matter). Selection
+    + pairing is delegated to the shared mri_slices module - the SAME selector the
+    trainer uses - so serving scores the same slices training saw. Returns
+    (pairs, batch) or (None, None) if empty. Imports torch/PIL lazily.
     """
     import numpy as np
     from PIL import Image
@@ -83,25 +81,87 @@ def _build_batch(anat_dir: str, anat_gm_dir: str, input_size: int):
         max_slices=MRI_MAX_SLICES,
     )
     if not pairs:
-        return None
+        return None, None
 
     def _load(path):
         img = Image.open(path).convert("L").resize((input_size, input_size))
         return np.asarray(img, dtype=np.float32) / 255.0
 
     chans = [np.stack([_load(a), _load(g)], axis=0) for a, g in pairs]  # each (2,H,W)
-    return torch.from_numpy(np.stack(chans, axis=0))                    # (N, 2, H, W)
+    return pairs, torch.from_numpy(np.stack(chans, axis=0))             # (N, 2, H, W)
+
+
+# =============================================================================
+# XAI: Grad-CAM heatmap (why the CNN scored a slice the way it did)
+# =============================================================================
+def _slice_number(path: str) -> int:
+    """Axial slice index from a filename like '0010001_anat_0094.jpg' -> 94."""
+    base = os.path.splitext(os.path.basename(path))[0]
+    tail = base.split("_")[-1]
+    return int(tail) if tail.isdigit() else -1
+
+
+def _heat_colors(x):
+    """Map a 0-1 array to a blue->red heatmap (H,W)->(H,W,3): cool=ignored, hot=looked hard."""
+    import numpy as np
+    r = np.interp(x, [0.00, 0.35, 0.66, 0.89, 1.00], [0, 0, 255, 255, 128])
+    g = np.interp(x, [0.00, 0.125, 0.375, 0.64, 0.91, 1.00], [0, 0, 255, 255, 0, 0])
+    b = np.interp(x, [0.00, 0.11, 0.34, 0.65, 1.00], [128, 255, 255, 0, 0])
+    return np.stack([r, g, b], axis=-1).astype(np.uint8)
+
+
+def _to_data_uri(rgb) -> str:
+    """Encode an (H,W,3) uint8 image as a PNG data URI a Power Apps Image can show."""
+    import base64
+    from io import BytesIO
+    from PIL import Image
+    buf = BytesIO()
+    Image.fromarray(rgb).save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _gradcam_overlay(model, slice_tensor, alpha: float = 0.45):
+    """Grad-CAM overlay for one slice, drawn on its anat (grayscale) image.
+
+    Runs the slice through the CNN, uses the gradient of the ADHD score w.r.t. the
+    last convolution's feature maps to see which regions mattered, and paints a
+    red(=looked hard)/blue(=ignored) overlay on the brain. Returns (H,W,3) uint8.
+    """
+    import numpy as np
+    from PIL import Image
+    import torch
+
+    x = slice_tensor.unsqueeze(0).clone()               # (1,2,H,W)
+    acts = model.features(model.input_norm(x))          # last conv maps (1,C,h,w)
+    acts.retain_grad()
+    logit = model.classifier(torch.flatten(model.pool(acts), 1)).squeeze()
+    model.zero_grad()
+    logit.backward()
+
+    weights = acts.grad.mean(dim=(2, 3), keepdim=True)          # importance per channel
+    cam = torch.relu((weights * acts).sum(dim=1)).squeeze(0)    # (h,w)
+    cam = cam.detach().cpu().numpy()
+    if cam.max() > 0:
+        cam = cam / cam.max()                                   # normalise 0-1
+
+    size = slice_tensor.shape[-1]
+    cam_up = np.asarray(Image.fromarray((cam * 255).astype(np.uint8))
+                        .resize((size, size), Image.BILINEAR)) / 255.0
+    heat = _heat_colors(cam_up)                                 # (H,W,3)
+    gray = (slice_tensor[0].cpu().numpy() * 255).astype(np.uint8)   # anat background
+    gray_rgb = np.stack([gray] * 3, axis=-1)
+    return ((1 - alpha) * gray_rgb + alpha * heat).astype(np.uint8)
 
 
 # =============================================================================
 # Scoring (loads the SEPARATE CNN module - no architecture defined here)
 # =============================================================================
 def _score_with_cnn(anat_dir: str, anat_gm_dir: str):
-    """Run the trained CNN over a patient's paired slices -> (risk, confidence).
+    """Run the trained CNN over a patient's paired slices -> risk/confidence/heatmap.
 
-    Returns a dict {mri_risk_score, confidence, slices_scored} on success, or
-    None to signal the caller to report a "pending / untrained" result (missing
-    weights, missing deps, or unreadable slices). risk & confidence are 0-100.
+    Returns a dict {mri_risk_score, confidence, slices_scored, top_slice_index,
+    heatmap_image} on success, or None to signal a "pending / untrained" result
+    (missing weights, missing deps, or unreadable slices). risk/confidence 0-100.
     """
     if not os.path.exists(CNN_PATH):
         return None
@@ -110,13 +170,12 @@ def _score_with_cnn(anat_dir: str, anat_gm_dir: str):
         import mri_model   # the SEPARATE architecture module
 
         model = mri_model.load_cnn(CNN_PATH, map_location="cpu")   # eval-mode
-        batch = _build_batch(anat_dir, anat_gm_dir, model.input_size)
+        pairs, batch = _load_pairs_batch(anat_dir, anat_gm_dir, model.input_size)
         if batch is None or batch.shape[0] == 0:
             return None
 
         with torch.no_grad():
-            logits = model(batch)                 # (N,)
-            probs = torch.sigmoid(logits)         # per-slice ADHD probability
+            probs = torch.sigmoid(model(batch))   # per-slice ADHD probability (N,)
 
         # Patient-level aggregation is the SERVING layer's job (the CNN is a pure
         # per-slice classifier): mean slice probability -> one 0-100 risk.
@@ -125,10 +184,21 @@ def _score_with_cnn(anat_dir: str, anat_gm_dir: str):
         # (0 = model on the fence, 100 = fully confident), averaged over slices.
         confidence = float((probs - 0.5).abs().mean().item()) * 2.0 * 100.0
 
+        # XAI: single out the highest-risk slice and draw a Grad-CAM heatmap for it.
+        top = int(torch.argmax(probs).item())
+        top_slice_index = _slice_number(pairs[top][0])
+        heatmap_image = None
+        try:
+            heatmap_image = _to_data_uri(_gradcam_overlay(model, batch[top]))
+        except Exception:
+            logger.warning("Grad-CAM heatmap generation failed; returning score without it.")
+
         return {
             "mri_risk_score": round(min(max(risk, 0.0), 100.0), 2),
             "confidence": round(min(max(confidence, 0.0), 100.0), 2),
             "slices_scored": int(batch.shape[0]),
+            "top_slice_index": top_slice_index,
+            "heatmap_image": heatmap_image,
         }
     except Exception as exc:
         # Expected when the on-disk weights don't match the current architecture
@@ -219,6 +289,20 @@ def analyze_mri(patient_id: str) -> dict:
             "confidence": scored["confidence"],
             "slices_scored": scored["slices_scored"],
             "model_version": MODEL_VERSION,
+            # XAI: which slice drove the score, and a heatmap of where the CNN
+            # looked (a PNG data URI a Power Apps Image control can show directly).
+            "explanation": {
+                "mri_model": {
+                    "available": True,
+                    "top_slice_index": scored["top_slice_index"],
+                    "heatmap_image": scored["heatmap_image"],
+                    "summary": (
+                        f"The image model's decision was driven most by brain "
+                        f"slice {scored['top_slice_index']}. On the heatmap, red "
+                        f"areas are where the model looked hardest; blue areas it "
+                        f"mostly ignored."),
+                }
+            },
         }
 
     except HTTPException:

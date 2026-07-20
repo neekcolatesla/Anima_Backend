@@ -94,6 +94,32 @@ class DSM5Head(nn.Module):
         return {"input_dim": self.input_dim, "note_pca_k": self.note_pca_k,
                 "structured_dim": self.structured_dim}
 
+    # -- explainability helpers (exact, because the head is linear) -------------
+    def structured_effective_weight(self) -> torch.Tensor:
+        """Per-structured-feature weight acting on the RAW (unstandardised) value.
+
+        Because the head standardises then applies a linear layer, feature i's
+        contribution to the logit is w_i * (x_i - mean_i), where w_i is this
+        weight. Lets the API show exactly how much each score/demographic pushed
+        the prediction.
+        """
+        w = self.linear.weight.detach().squeeze(0)          # (feat_dim,)
+        return w[:self.structured_dim] / self.feat_std[:self.structured_dim]
+
+    def note_effective_weight(self) -> torch.Tensor:
+        """768-d weight ``w`` such that the clinical note contributes ``w . e`` to
+        the logit (plus a constant), where ``e`` is the note embedding.
+
+        Folds the note-block linear weights, the standardisation, and (if used) the
+        note-PCA back onto the raw 768-d embedding space, so a single dot product
+        with each word's embedding gives that word's push on the score.
+        """
+        w = self.linear.weight.detach().squeeze(0)          # (feat_dim,)
+        g = w[self.structured_dim:] / self.feat_std[self.structured_dim:]  # note dims
+        if self.note_pca_k:
+            return self.note_components.detach().t() @ g     # (768,)
+        return g                                             # (768,)
+
 
 def save_head(model: DSM5Head, path: str) -> None:
     """Persist as {config, state_dict} - all tensors/primitives (weights_only-safe)."""

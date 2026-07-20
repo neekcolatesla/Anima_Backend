@@ -81,26 +81,36 @@ def _run_components(patient_id: str):
     nlp_result = analyze_patient(patient_id)
     nlp_risk = nlp_result.get("nlp_risk_score")
     subtype = nlp_result.get("predicted_subtype")
+    # Its XAI block (feature importance + influential words).
+    text_explanation = (nlp_result.get("explanation") or {}).get("text_model")
 
     # Image model (optional). No scans (404) or untrained ("pending") -> None.
     mri_risk, mri_status = None, "unavailable"
+    mri_explanation = {"available": False, "reason": "unavailable"}
     try:
         mri_result = analyze_mri(patient_id)
         mri_status = mri_result.get("status", "unavailable")
         if mri_status == "success":
             mri_risk = mri_result.get("mri_risk_score")
+            # Its XAI block (top slice + Grad-CAM heatmap).
+            mri_explanation = (mri_result.get("explanation") or {}).get(
+                "mri_model", {"available": False, "reason": "unavailable"})
+        else:
+            mri_explanation = {"available": False, "reason": mri_status}
     except HTTPException as exc:
         if exc.status_code == 404:
             mri_status = "no_scans"      # patient has no current MRI - NLP only
+            mri_explanation = {"available": False, "reason": "no_scans"}
         else:
             raise
 
-    return nlp_risk, mri_risk, subtype, mri_status
+    return nlp_risk, mri_risk, subtype, mri_status, text_explanation, mri_explanation
 
 
 def analyze_combined(patient_id: str, created_by: str = None) -> dict:
     """Run + fuse both models, persist an Analysis_Result audit row, return result."""
-    nlp_risk, mri_risk, subtype, mri_status = _run_components(patient_id)
+    (nlp_risk, mri_risk, subtype, mri_status,
+     text_explanation, mri_explanation) = _run_components(patient_id)
 
     combined, weighting = _fuse(nlp_risk, mri_risk)
     if combined is None:
@@ -157,6 +167,11 @@ def analyze_combined(patient_id: str, created_by: str = None) -> dict:
         "predicted_subtype": subtype,
         "weighting": weighting,
         "model_version": MODEL_VERSION,
+        # XAI: both channels' explanations for the frontend (bar chart + heatmap).
+        "explanation": {
+            "text_model": text_explanation,
+            "mri_model": mri_explanation,
+        },
     }
 
 
