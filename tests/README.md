@@ -7,12 +7,16 @@ tests/
 ├── conftest.py            # app import path + an in-memory MOCK DATABASE + shared fixtures
 ├── pytest.ini             # marker registration
 ├── requirements-test.txt  # pytest + httpx (the rest come from the app's requirements.txt)
-├── ingestion/             # ingestion workflow  (this milestone)
-├── mri_analysis/          # (to come)
-├── dsm5_analysis/         # (to come)
-├── combined_analysis/     # (to come)
-└── xai/                   # (to come)
+├── ingestion/             # CSV + MRI ingestion, and live seeding of 130–222
+├── dsm5_analysis/         # text & demographic (NLP) engine
+├── mri_analysis/          # image (CNN) engine
+├── combined_analysis/     # fusion engine + RBAC + audit trail
+└── xai/                   # the explanation layer across all three engines
 ```
+
+Every category follows the same shape: `*_unit.py` (fast, mocked, offline) plus a
+`*_live.py` carrying the **same 8 scenarios** over the held-out 130–222 cohort
+(3 random, 1 random, 3 inattentive / hyperactive / combined, then 30 / 50 / all).
 
 ## Two kinds of test (markers)
 
@@ -30,10 +34,15 @@ From the repo root (or from `tests/`):
 ```powershell
 pip install -r tests/requirements-test.txt        # once
 
-pytest tests/ingestion                # unit tests only; live tests skipped by default
-pytest tests/ingestion -m unit        # same - only the fast offline unit tests
-pytest tests/ingestion -m live        # opt IN to the live DB integration test
+pytest tests/xai                      # unit tests only; live tests skipped by default
+pytest tests/xai -m unit              # same - only the fast offline unit tests
+pytest tests/xai -m live -s           # opt IN to the live scenarios (-s to see printouts)
+pytest tests                          # the whole suite (all unit tests; live auto-skipped)
 ```
+
+Swap `xai` for any category (`ingestion`, `dsm5_analysis`, `mri_analysis`,
+`combined_analysis`). The live scenarios need the DB up, `.env` set, and the
+130–222 cohort seeded (DSM-5) and MRI-ingested; they auto-skip otherwise.
 
 ## What ingestion covers
 
@@ -54,3 +63,24 @@ pytest tests/ingestion -m live        # opt IN to the live DB integration test
   > This test writes ~93 patients to the live DB (that's the point). It's
   > idempotent, so safe to re-run. It needs the DB up, the schema already created,
   > `.env` configured, and both `data/*_130-222.csv` files present.
+
+## What the analysis categories cover
+
+- **`dsm5_analysis/`** — unit tests exercise the subtype rules, the heuristic
+  fallback, and the trained-head path (BERT stubbed, a real tiny head saved) end to
+  end against the mock DB; the live suite reports NLP diagnosis accuracy on 130–222.
+- **`mri_analysis/`** — unit tests run the real CNN over synthetic slice folders
+  (fetch → score → heatmap → persist); the live suite reports the CNN's held-out
+  diagnosis accuracy on the ingested 130–222 scans.
+- **`combined_analysis/`** — unit tests cover the fusion maths (0.7 NLP / 0.3 MRI),
+  the graceful single-channel fallbacks, the append-only `Analysis_Result` audit row
+  with `created_by`, and RBAC on both the trigger and the retrieval reads; the live
+  suite reports the fused accuracy alongside NLP-only and MRI-only for comparison.
+- **`xai/`** — unit tests prove each explanation is well-formed in isolation: the
+  DSM-5 feature-importance bars and signed per-word "push" attribution, the MRI
+  Grad-CAM pipeline (slice parsing, colour map, PNG data-URI encoding, overlay), and
+  that the combined engine merges both channels and degrades the image channel to an
+  honest `available: False` when scans are missing/untrained. The live suite checks,
+  on 130–222, that every rendered explanation is valid — ranked ~100% bars, decodable
+  Grad-CAM PNGs, and influential words that are genuine tokens **from the patient's
+  own note**.
