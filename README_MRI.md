@@ -254,20 +254,43 @@ per-seed accuracy plus a cross-seed mean ± std. A tuning change is only real if
 holds up **across** seeds — if the gain evaporates in the ± spread, it was
 fold-luck, not signal. Run candidate configs this way before believing them.
 
-### On the expected result (be honest)
+### Achieved result
 
-Classifying ADHD from *structural* MRI is genuinely hard: on ADHD-200-scale data,
-image-only structural models typically land from near-chance to the low-60s percent,
-well below the demographic/DSM-5 signal. A near-chance patient accuracy here is
-therefore **consistent with the literature, not a bug** — and, crucially, a
-chance-level score under a strict patient-level split is what a *non-leaking*
-pipeline looks like (the opposite of the DSM-5 notes-leakage failure). The central
-slice selection and `--sweep` are the principled levers to probe for signal; they
-are not guaranteed to lift a fundamentally weak modality, and should not be pushed
-into overfitting the test folds.
+Command:
 
-## 4. What's next (deferred)
+```powershell
+python train_mri.py --augment --label-smoothing 0.05 --epochs 40 --seeds 42,7,123
+```
 
-- **Combined Risk Analysis** — the orchestration that fuses `nlp_risk_score` and
-  `mri_risk_score` into `Analysis_Result.final_combined_score` + subtype (the
-  append-only audit table already exists for it).
+| Configuration | Patient accuracy (cross-seed) |
+|---------------|-------------------------------|
+| Baseline (central slices only, no augmentation) | **0.540 ± 0.018** (≈ majority baseline 0.535) |
+| **+ augmentation + label smoothing + input-norm, full central stack** | **0.631 ± 0.030** |
+
+The lift (~+0.09) is **larger than the cross-seed spread** and holds across all three
+seeds (0.590 / 0.643 / 0.659), so it is signal, not fold-luck. The per-fold
+**train/test gap is ~+0.10** (train ≈ 0.72, test ≈ 0.63): the model is clearly
+*learning* (train and test both well above the 0.54 baseline) with only mild
+overfitting — which answers the "is the CNN too shallow?" question directly. It is
+**not** underfitting; a deeper network would widen that gap (memorise train, drop
+test), so the shallow design + augmentation is the right regime.
+
+**Be honest when citing it.** Classifying ADHD from *structural* MRI is genuinely
+hard: image-only structural models on ADHD-200-scale data credibly land in the
+low-to-mid 60s at best, well below the demographic/DSM-5 signal. **0.63 ± 0.03** is
+squarely in that credible range, achieved under a strict patient-level, no-leakage
+protocol — a solid, defensible result, but still a *supporting* channel, not a
+standalone diagnostic. Two caveats to state in the write-up:
+
+- Report the **cross-validated 0.63 ± 0.03**, not the single best fold. The shipped
+  `mri_cnn.pt` is the best-generalising fold (seed 7 / fold 2, 0.769), which is
+  optimistic; serving the best fold is fine, but 0.63 is the honest expected number.
+- Small cohort (129 patients); the imaging channel is deliberately weighted below
+  the text/demographic channel in the combined score (0.3 vs 0.7).
+
+## 4. What's next
+
+- **Combined Risk Analysis** — *built*. Fuses `nlp_risk_score` + `mri_risk_score`
+  into `Analysis_Result.final_combined_score` + subtype (NLP-weighted 0.7/0.3),
+  with an XAI `explanation` block (feature importance, influential words, and a
+  Grad-CAM brain heatmap). See `README_COMBINED.md`.

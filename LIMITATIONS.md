@@ -113,7 +113,7 @@ features. The shipped model is the best full configuration (PCA-8), which keeps
 the hybrid architecture while remaining robust; a structured-only model would be
 marginally higher but discards the text component entirely.
 
-## 7. Overall limitation
+## 7. Overall limitation (text & demographic model)
 
 The ingestion, feature-extraction, cross-validation, fusion, and serving pipeline
 are demonstrated to function end-to-end. However, because the clinical notes are
@@ -124,3 +124,46 @@ circularity caveat of Section 2. Establishing the true predictive value of the
 natural-language component would require **independently-authored clinical
 narratives** and, ideally, **external validation on a held-out cohort**. These
 are identified as future work.
+
+---
+
+## 8. Imaging model (MRI CNN) result and limitations
+
+The image classifier is a deliberately shallow 2-channel CNN (anat + grey-matter)
+trained with a **patient-level** 5-fold cross-validation (all of a patient's slices
+stay on one side of every split, so no slice from a brain leaks across train/test).
+
+**Result (cross-seed, seeds 42/7/123):**
+
+| Configuration | Patient accuracy |
+|---------------|------------------|
+| Central-slice selection only (no augmentation) | 0.540 ± 0.018 (≈ majority baseline 0.535) |
+| + augmentation + label smoothing + input standardisation, full central stack | **0.631 ± 0.030** |
+
+The +0.09 improvement exceeds the cross-seed spread and is consistent across all
+three seeds, so it is a genuine gain rather than a lucky fold partition. The
+per-fold train/test gap is modest (~0.10; train ≈ 0.72, test ≈ 0.63), indicating
+the model **learns real structure without severe overfitting** — an intentionally
+shallow network is the appropriate capacity for a 129-patient cohort; a deeper
+model would widen that gap.
+
+**Limitations to state when citing 0.63:**
+
+1. **Weak modality by nature.** Structural-MRI-only ADHD classification is a hard
+   problem; published image-only structural models on ADHD-200-scale data credibly
+   reach only the low-to-mid 60s. 0.63 ± 0.03 sits in that credible range but is far
+   from a standalone diagnostic — hence the imaging channel is weighted **0.3** (vs
+   **0.7** for the text/demographic channel) in the combined score.
+2. **Report the cross-validated mean, not the best fold.** The shipped `mri_cnn.pt`
+   is the single best-generalising fold (0.769); that figure is optimistic. The
+   honest expected performance is the CV mean **0.63 ± 0.03**.
+3. **Small cohort, single site.** 129 NYU-site patients. Robust evidence would need
+   a larger, multi-site sample and external validation.
+4. **Per-slice label noise.** Every axial slice inherits the patient's label though
+   many carry no ADHD-relevant signal; central-slice selection and label smoothing
+   mitigate but do not eliminate this.
+
+The pipeline (ingestion → patient-level CV → serving → Grad-CAM explanation) is
+demonstrated end-to-end; the imaging channel's role is to *support* the stronger
+text/demographic signal in the fused score, which is how the combined model is
+weighted.
