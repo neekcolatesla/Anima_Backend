@@ -64,8 +64,18 @@ class MockDB:
     def __init__(self):
         self.patients = {}       # patient_ID -> {name, biological_sex, is_child, age}
         self.assessments = []    # [{assessment_ID, patient_ID, ...}]
-        self.mri = []            # [{patient_ID, scan_type, file_path, is_current, scan_session, slice_count}]
+        self.mri = []            # [{MRI_ID, patient_ID, scan_type, file_path, is_current, scan_session, slice_count, mri_risk_score}]
         self._aid = 0
+        self._mri_id = 0
+
+    def add_mri(self, patient_id, scan_type, file_path, is_current=1,
+                scan_session=1, slice_count=None, mri_risk_score=None):
+        self._mri_id += 1
+        self.mri.append({"MRI_ID": self._mri_id, "patient_ID": patient_id,
+                         "scan_type": scan_type, "file_path": file_path,
+                         "is_current": is_current, "scan_session": scan_session,
+                         "slice_count": slice_count, "mri_risk_score": mri_risk_score})
+        return self._mri_id
 
     # -- assessment helpers --
     def add_assessment(self, patient_id, **fields):
@@ -166,6 +176,17 @@ class FakeCursor:
                           if r["patient_ID"] == pid and r["scan_type"] == scan_type
                           and r["is_current"] == 1]
 
+        # MRI_Analysis.analyze_mri: current scan folders for a patient.
+        elif q.startswith("SELECT MRI_ID, scan_type, file_path FROM dbo.MRI"):
+            self._last = [(r["MRI_ID"], r["scan_type"], r["file_path"]) for r in db.mri
+                          if r["patient_ID"] == params[0] and r["is_current"] == 1]
+
+        elif q.startswith("UPDATE dbo.MRI SET mri_risk_score"):
+            risk, mri_id = params
+            for r in db.mri:
+                if r["MRI_ID"] == mri_id:
+                    r["mri_risk_score"] = risk
+
         elif q.startswith("DELETE FROM dbo.MRI"):
             pid, scan_type = params
             db.mri = [r for r in db.mri if not (r["patient_ID"] == pid
@@ -179,9 +200,8 @@ class FakeCursor:
 
         elif q.startswith("INSERT INTO dbo.MRI"):
             pid, scan_type, file_path, slice_count, session = params
-            db.mri.append({"patient_ID": pid, "scan_type": scan_type,
-                           "file_path": file_path, "slice_count": slice_count,
-                           "is_current": 1, "scan_session": session})
+            db.add_mri(pid, scan_type, file_path, is_current=1,
+                       scan_session=session, slice_count=slice_count)
 
         return self
 
