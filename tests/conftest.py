@@ -134,6 +134,21 @@ class FakeCursor:
             aid = db.latest_aid(params[0])
             self._last = [(aid,)] if aid is not None else []
 
+        # DSM5_Analysis.analyze_patient: latest assessment joined with demographics.
+        elif q.startswith("SELECT TOP 1 p.age, p.biological_sex, p.is_child, d.assessment_ID"):
+            a = db.assessment_for(params[0])
+            p = db.patients.get(params[0])
+            if a is None or p is None:
+                self._last = []
+            else:
+                self._last = [(p.get("age"), p.get("biological_sex"), p.get("is_child"),
+                               a["assessment_ID"], a.get("inattentive_score"),
+                               a.get("hyperactive_score"), a.get("clinician_notes"))]
+
+        elif q.startswith("UPDATE dbo.DSM5_Assessment SET nlp_risk_score"):
+            risk, aid = params
+            db.update_assessment(aid, nlp_risk_score=risk)
+
         elif q.startswith("UPDATE dbo.DSM5_Assessment SET raw_answers"):
             raw, notes, aid = params
             db.update_assessment(aid, raw_answers=raw, clinician_notes=notes)
