@@ -5,6 +5,8 @@ services:
   db:
     image: mcr.microsoft.com/mssql/server:2022-latest
     container_name: anima_sqlserver
+    # Auto-start on VM boot / after a stop-start (don't leave the DB down).
+    restart: unless-stopped
     environment:
       ACCEPT_EULA: "Y"
       # SA password is pulled from the local .env file (MSSQL_SA_PASSWORD)
@@ -33,6 +35,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: anima_api
+    # Auto-restart on crash and come back after a VM stop-start.
+    restart: unless-stopped
     ports:
       - "8000:8000"
     depends_on:
