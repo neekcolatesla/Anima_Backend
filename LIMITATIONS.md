@@ -167,3 +167,64 @@ The pipeline (ingestion → patient-level CV → serving → Grad-CAM explanatio
 demonstrated end-to-end; the imaging channel's role is to *support* the stronger
 text/demographic signal in the fused score, which is how the combined model is
 weighted.
+
+---
+
+## 9. Held-out validation on an unseen cohort (patients 130–222)
+
+Sections 1–8 report **cross-validation** figures — the model is repeatedly
+retrained and scored on rotating folds *within* the original 129-patient cohort.
+CV estimates generalisation but still reuses every patient for both training and
+evaluation across the folds. To test true generalisation, a second cohort of
+**93 patients (ScanDir IDs 130–222)** was ingested *after* both models were frozen.
+Neither model was retrained: the shipped weights (trained on patients 1–129) were
+run on these 93 unseen patients exactly as they would be in production. This is the
+strongest evidence in the project of how each channel behaves on genuinely new data.
+
+**Result (frozen models, 93 held-out patients):**
+
+| Channel | Held-out accuracy | For comparison (Sections 4/8) |
+|---------|-------------------|-------------------------------|
+| Text & demographic (NLP + structured) | **0.935** | scores-only CV ≈ 0.92 |
+| Imaging (MRI CNN) | **0.516** | CV mean 0.63; best fold 0.77 |
+
+Two findings, both important to state plainly in the dissertation:
+
+1. **The text/demographic channel generalises.** 0.935 on a fully held-out cohort
+   is consistent with (indeed slightly above) the ~0.92 structured-feature CV
+   baseline, confirming that the structured features carry real, transferable
+   signal and that the serving path (feature extraction → frozen model → score) is
+   sound. The reader should still apply the circularity caveat of Section 2: the
+   structured Conners'-derived scores are close relatives of the label. This is a
+   property of the ADHD-200 labelling, not an artefact of leakage in our pipeline,
+   and it is the same caveat that applies to the 0.92 baseline.
+
+2. **The imaging channel drops to chance on held-out data.** The MRI CNN falls from
+   a 0.63 CV mean (0.77 best fold) to **0.516** — statistically indistinguishable
+   from the 0.535 majority baseline — with held-out risk scores clustering near the
+   50 decision boundary (an uncertain model). This is a textbook demonstration that
+   **cross-validation, and especially the best fold, is optimistic**: the honest
+   figure for a shipped single-fold model on unseen patients is the held-out number,
+   not the best-fold number. It does **not** mean the imaging pipeline is broken —
+   ingestion, patient-level CV, serving and Grad-CAM all function — but it does mean
+   the structural-MRI channel carries little standalone generalising signal on this
+   small single-site cohort, exactly the weak-modality risk flagged in Section 8.
+
+**Consequence for the fusion design.** These two numbers are the empirical
+justification for the **0.7 (text) / 0.3 (imaging)** weighting in the combined
+score (Section 6, Combined_Analysis). A strong, generalising text channel is
+correctly given the majority of the weight, while the weak imaging channel is
+retained as a minority supporting signal rather than allowed to pull the fused
+prediction toward chance. Had the weights been equal, the combined held-out
+accuracy would have been dragged down by the imaging channel; the NLP-dominant
+weighting keeps the fused call tracking the strong channel. The combined-analysis
+live test suite records the fused, NLP-only and MRI-only accuracies side by side on
+these same 93 patients so this trade-off is reproducible and auditable.
+
+**Caveat on the held-out figures themselves.** The 130–222 cohort is still
+single-site (NYU) and still uses synthetic, label-derived clinical notes, so the
+0.935 remains subject to the Section 7 limitation on the natural-language
+component. Held-out validation removes the *within-cohort reuse* optimism of CV; it
+does not remove the *dataset-level* circularity of the Conners'-derived features or
+the synthetic-notes caveat. External, independently-labelled, multi-site validation
+remains future work.

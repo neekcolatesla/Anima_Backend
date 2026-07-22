@@ -17,7 +17,7 @@ Server connection (via pyodbc) on startup, and wires in the feature routers:
 import os
 import logging
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -106,12 +106,30 @@ def health(conn: pyodbc.Connection = Depends(get_db)) -> dict:
         raise HTTPException(status_code=503, detail=f"Database unavailable: {exc}")
 
 
+# --- API-key gate (optional shared secret for the feature routers) -----------
+# Set ANIMA_API_KEY in the environment to require callers (e.g. the Power Apps
+# custom connector) to send it as an "X-API-Key" header. Left UNSET this is a
+# no-op, so local/dev runs are unaffected. The liveness ("/"), readiness
+# ("/health") and docs ("/docs", "/openapi.json") routes above are deliberately
+# NOT gated, so uptime checks and connector-spec generation keep working.
+API_KEY = os.getenv("ANIMA_API_KEY")
+
+
+def require_api_key(x_api_key: str = Header(default=None, alias="X-API-Key")) -> None:
+    """Reject callers missing the shared key - but only when a key is configured."""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
 # --- Wire the feature routers into the application ----------------------------
-app.include_router(auth_router)
-app.include_router(patients_router)
-app.include_router(csv_ingestion_router)
-app.include_router(mri_ingestion_router)
-app.include_router(dsm5_assessment_router)
-app.include_router(dsm5_analysis_router)
-app.include_router(mri_analysis_router)
-app.include_router(combined_analysis_router)
+# Every feature router sits behind require_api_key; the open liveness/readiness
+# and docs routes above are the only ungated endpoints.
+_protected = [Depends(require_api_key)]
+app.include_router(auth_router, dependencies=_protected)
+app.include_router(patients_router, dependencies=_protected)
+app.include_router(csv_ingestion_router, dependencies=_protected)
+app.include_router(mri_ingestion_router, dependencies=_protected)
+app.include_router(dsm5_assessment_router, dependencies=_protected)
+app.include_router(dsm5_analysis_router, dependencies=_protected)
+app.include_router(mri_analysis_router, dependencies=_protected)
+app.include_router(combined_analysis_router, dependencies=_protected)
