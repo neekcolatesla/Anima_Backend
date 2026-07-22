@@ -1,0 +1,16 @@
+# Normalize line endings. This project deploys to a Linux VM, so everything is
+# stored AND checked out as LF - CRLF in shell scripts / Dockerfile / Caddyfile /
+# compose can misbehave on Linux. This also stops the "whole tree shows modified"
+# churn you hit after the merge (Windows flipping files to CRLF).
+* text=auto eol=lf
+
+# Belt-and-suspenders: keep binary assets untouched.
+*.pt   binary
+*.pth  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gz   binary
+*.nii  binary
+*.pdf  binary
+*.xlsx binary
