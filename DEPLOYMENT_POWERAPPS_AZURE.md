@@ -59,25 +59,60 @@ Pick names once:
 
 ```powershell
 $RG   = "anima-rg"
-$LOC  = "uksouth"
+$LOC  = "swedencentral"
 $VM   = "anima-vm"
-$DNS  = "anima-$(Get-Random -Max 99999)"   # becomes <DNS>.uksouth.cloudapp.azure.com
+$DNS  = "anima-$(Get-Random -Max 99999)"   # becomes <DNS>.swedencentral.cloudapp.azure.com
 az group create -n $RG -l $LOC
 ```
+
+> **Azure-for-Students region lock (learned the hard way on the first run).** This
+> subscription enforces a policy that only permits a fixed set of regions.
+> `uksouth`, `ukwest`, and `westeurope` are all **rejected at deploy time** with
+> `RequestDisallowedByAzure` — the resource group is created but the VM deployment
+> fails. Check your own allow-list *before* choosing `$LOC`:
+>
+> ```powershell
+> az policy assignment list --query "[].{Name:displayName, Parameters:parameters}" -o json
+> ```
+>
+> On this subscription the allowed regions were **germanywestcentral, swedencentral,
+> italynorth, switzerlandnorth, norwayeast**; we used `swedencentral`. The DNS suffix
+> follows the region you pick (`<DNS>.<region>.cloudapp.azure.com`). If you change the
+> resource group's region you must `az group delete -n $RG --yes` first — a group
+> can't be re-created in a new location while it still exists.
 
 ---
 
 ## Part 1 — Create the Ubuntu VM
 
-SQL Server + PyTorch/BERT + the API want memory, so use a **B2ms (2 vCPU, 8 GB)**;
-B2s (4 GB) is the bare minimum and can be tight.
+SQL Server + PyTorch/BERT + the API want memory, so aim for **2 vCPU / 8 GB**. We
+deployed on a **Standard_D2s_v3** (2 vCPU, 8 GB) and also enlarged the OS disk to
+**64 GB** up front — see the two callouts below for why both of those matter.
 
 ```powershell
 az vm create -g $RG -n $VM `
-  --image Ubuntu2204 --size Standard_B2ms `
+  --image Ubuntu2204 --size Standard_D2s_v3 `
+  --os-disk-size-gb 64 `
   --admin-username azureuser --generate-ssh-keys `
   --public-ip-address-dns-name $DNS
 ```
+
+> **VM size can be capacity-blocked (`SkuNotAvailable`), which is *not* the same as
+> the region policy above.** On the first run the cheap B-series was unavailable in
+> every allowed region we tried — `Standard_B2ms`, `Standard_B1s`, `Standard_B2s`,
+> and `Standard_A2_v2` all returned `SkuNotAvailable` (capacity restrictions), region
+> by region. `Standard_D2s_v3` in `swedencentral` was the first that provisioned. If
+> you get `SkuNotAvailable`, either try another allowed region or step up to a
+> D-series; you can list what's actually available with
+> `az vm list-skus -l $LOC --size Standard_D --all -o table`. D2s_v3 is a good fit
+> anyway — more headroom for the torch + BERT image than a B-series.
+
+> **The default 30 GB OS disk is too small — it caused the deploy to fail.** The API
+> image bundles PyTorch and the pre-downloaded Bio_ClinicalBERT weights, so extracting
+> it needs well over 30 GB. On the first attempt the build finished but the image
+> *export* died with `no space left on device` (on the Bio_ClinicalBERT blob), even
+> after `docker system prune`. Creating the VM with `--os-disk-size-gb 64` avoids this.
+> If you already created a 30 GB VM, resize it after the fact — see Appendix A.
 
 Open only the ports Caddy needs (plus SSH). Do **not** open 1433 or 8000 — they
 stay private.
@@ -86,6 +121,17 @@ stay private.
 az vm open-port -g $RG -n $VM --port 80  --priority 1001
 az vm open-port -g $RG -n $VM --port 443 --priority 1002
 ```
+
+> **If `az vm open-port` fails with `ResourceNotFound` for `<vm>NSG`/`<vm>VMNic`,**
+> the auto-created network security group wasn't named the way the shortcut expects
+> (this happened to us). Find the real NSG name and add the rules directly — pick
+> priorities that don't collide with any existing rule:
+>
+> ```powershell
+> $REAL_NSG = az network nsg list -g $RG --query "[0].name" -o tsv
+> az network nsg rule create -g $RG --nsg-name $REAL_NSG --name AllowHTTP  --priority 1100 --destination-port-ranges 80  --protocol Tcp --access Allow
+> az network nsg rule create -g $RG --nsg-name $REAL_NSG --name AllowHTTPS --priority 1110 --destination-port-ranges 443 --protocol Tcp --access Allow
+> ```
 
 Your public hostname is now `${DNS}.${LOC}.cloudapp.azure.com` — note it; Caddy
 will get a TLS cert for exactly this name.
@@ -124,9 +170,11 @@ The CSVs and MRI scans are git-ignored, so copy them up from your **local** mach
 wait:
 
 ```powershell
-$HOST = "${DNS}.${LOC}.cloudapp.azure.com"
-scp .\data\*.csv azureuser@${HOST}:~/anima/data/
-# optional, larger: scp -r .\data\mri azureuser@${HOST}:~/anima/data/
+# NB: don't use $HOST — it's a read-only built-in in PowerShell and the assignment
+# silently fails (scp then tries to resolve a bogus hostname). Use $FQDN.
+$FQDN = "${DNS}.${LOC}.cloudapp.azure.com"
+scp .\data\*.csv azureuser@${FQDN}:~/anima/data/
+# optional, larger: scp -r .\data\mri azureuser@${FQDN}:~/anima/data/
 ```
 
 Create `.env` in `~/anima` on the VM (same variables your compose reads):
@@ -146,6 +194,13 @@ EOF
 decrypt correctly. SQL Server rejects weak SA passwords — use 12+ chars with mixed
 case, digits, and a symbol.
 
+> **No spaces around the `=` in `.env`.** Write `MSSQL_SA_PASSWORD=Th!s1s...`, not
+> `MSSQL_SA_PASSWORD= Th!s1s...`. Compose does not strip a leading space, so the space
+> becomes part of the password. It still *works* as long as `MSSQL_SA_PASSWORD` and
+> `DB_PASSWORD` carry the identical space (they stay consistent), but it will bite you
+> the moment you type the password by hand — e.g. connecting with `sqlcmd`. Cleanest
+> to avoid it entirely.
+
 ---
 
 ## Part 4 — Add HTTPS with Caddy
@@ -153,10 +208,14 @@ case, digits, and a symbol.
 Create two files in `~/anima`. First a `Caddyfile` (swap in your real hostname):
 
 ```
-anima-XXXXX.uksouth.cloudapp.azure.com {
+anima-XXXXX.swedencentral.cloudapp.azure.com {
     reverse_proxy api:8000
 }
 ```
+
+> Use your **exact** VM hostname here (region included) — Caddy requests the TLS cert
+> for this literal name, so a mismatch means no certificate. And put it in the
+> `Caddyfile`; typing it at the shell prompt (easy slip) just gives "command not found".
 
 Then a compose overlay `docker-compose.prod.yml` that adds Caddy (and stops the API
 from publishing 8000 to the host, so only Caddy is public):
@@ -215,26 +274,133 @@ Notes:
 
 ---
 
-## Part 6 — (Recommended) Add a simple API key
+## Part 5.5 — Verify the API is up and running
 
-The analysis endpoints trust a `requester_user_id` query parameter — fine for the
-RBAC logic, but nothing stops a stranger who finds the URL. Before a public demo,
-add a shared key the connector sends as a header. Minimal FastAPI dependency in
-`main.py`:
+Work from the outside in: containers → API process → database → public HTTPS. There
+are **two** endpoints and they check different things:
 
-```python
-import os
-from fastapi import Header, HTTPException, Depends
-API_KEY = os.getenv("ANIMA_API_KEY")
-def require_api_key(x_api_key: str = Header(default=None)):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key.")
-# add to the protected routers, e.g.:
-# app.include_router(combined_analysis_router, dependencies=[Depends(require_api_key)])
+- `GET /`  → `{"service":"Anima API","status":"online",...}` — the process is alive
+  (a *liveness* check; does **not** touch SQL).
+- `GET /health` → `{"status":"healthy","database":"anima"}` — the API can run a live
+  `SELECT 1` against SQL Server (a *readiness* check; returns **503
+  `Database unavailable`** if the DB is down). This is the one that proves the whole
+  stack is wired together.
+
+**On the VM** (over SSH, in `~/anima`):
+
+```bash
+# 1. All four services in the expected state: db healthy, seed exited 0, api + caddy up
+docker compose -f docker-compose.yml -f docker-compose.prod.yml ps -a
+
+# 2. The seed finished cleanly (this is what populated the DB)
+docker compose logs seed | tail -20            # look for a success line, then "exited with code 0"
+
+# 3. The API booted and connected to SQL
+docker compose logs api | tail -30             # expect uvicorn "Application startup complete"
+
+# 4. Hit the API directly, bypassing Caddy/TLS. 8000 isn't published to the host
+#    (prod overlay sets ports: []), so curl from *inside* the api container:
+docker compose exec api curl -s http://localhost:8000/          # -> {"status":"online",...}
+docker compose exec api curl -s http://localhost:8000/health    # -> {"status":"healthy","database":"anima"}
 ```
 
-Add `ANIMA_API_KEY=<random-secret>` to `.env`, pass it through in the `api` service
-`environment:` block, and the connector sends it as `X-API-Key` (Part 8).
+If step 4's `/health` returns `online` on `/` but 503 on `/health`, the API is up but
+can't reach SQL — check the `.env` password (including the no-spaces gotcha in Part 3)
+and that `db` is healthy (`docker compose logs db | tail`).
+
+**Through Caddy + HTTPS** (from your laptop, or anywhere) — this is the path Power
+Apps will actually use:
+
+```bash
+# -k tolerates a not-yet-issued cert; drop it once TLS is live
+curl -sk https://<your-host>/health         # -> {"status":"healthy","database":"anima"}
+curl -sI https://<your-host>/docs           # -> HTTP/2 200
+```
+
+```powershell
+# PowerShell equivalents — NB: in PowerShell `curl` is an ALIAS for Invoke-WebRequest,
+# not real curl, so Unix flags like -s fail ("A drive with the name 'https' does not
+# exist"). Use the native cmdlet, or call real curl explicitly as `curl.exe`.
+Invoke-RestMethod  https://<your-host>/health
+(Invoke-WebRequest https://<your-host>/docs -UseBasicParsing).StatusCode   # 200
+curl.exe -s https://<your-host>/health                                     # real curl on Win10/11
+```
+
+**Confirm the TLS certificate actually issued** (Caddy needs 80 **and** 443 open and
+the exact `cloudapp.azure.com` hostname in the `Caddyfile`):
+
+```bash
+docker compose logs caddy | grep -iE "certificate obtained|serving initial|error"
+# from your laptop, inspect the live cert:
+curl -vI https://<your-host>/health 2>&1 | grep -iE "SSL connection|subject|issuer"
+```
+
+A green `curl -s https://<your-host>/health` (no `-k` needed) returning
+`"database":"anima"` means: process up, TLS valid, and SQL reachable — the stack is
+fully live. Finally, **warm the model** so the first real Power Apps call isn't slow:
+
+```bash
+curl -s -X POST "https://<your-host>/api/analysis/dsm5/0010001"   # first call loads BERT (~seconds)
+```
+
+---
+
+## Part 6 — API key on the feature routers (implemented)
+
+The analysis endpoints trust a `requester_user_id` query parameter — fine for the
+RBAC logic, but nothing stops a stranger who finds the URL. `main.py` therefore
+puts **every feature router** behind an optional shared key that the Power Apps
+connector sends as an `X-API-Key` header. It's already wired in:
+
+```python
+# main.py
+API_KEY = os.getenv("ANIMA_API_KEY")
+
+def require_api_key(x_api_key: str = Header(default=None, alias="X-API-Key")) -> None:
+    """Reject callers missing the shared key - but only when a key is configured."""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+_protected = [Depends(require_api_key)]
+app.include_router(auth_router,     dependencies=_protected)
+app.include_router(patients_router, dependencies=_protected)
+# ... through combined_analysis_router — all feature routers gated
+```
+
+Three properties worth knowing:
+
+- **Off by default.** With `ANIMA_API_KEY` unset the dependency is a no-op, so local
+  dev, the seed, and your current deployment keep working unchanged — turning it on
+  is opt-in.
+- **`/`, `/health`, `/docs`, and `/openapi.json` stay open**, so the uptime checks
+  (Part 5.5) and connector-spec generation (Part 7) keep working without the key.
+- The header is advertised in the OpenAPI spec, so the connector wizard detects it.
+
+`docker-compose.yml` already forwards the variable to the api container:
+
+```yaml
+    environment:
+      ...
+      ANIMA_API_KEY: ${ANIMA_API_KEY:-}   # blank = gate disabled
+```
+
+**To turn it on**, add a strong random value to `.env` on the VM and recreate the api:
+
+```bash
+# on the VM, in ~/anima
+echo "ANIMA_API_KEY=$(openssl rand -hex 24)" >> .env       # or paste your own secret
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate api
+```
+
+After that, unauthenticated calls to the feature endpoints return **401** while
+`/health` still answers `healthy`. Quick check:
+
+```bash
+curl.exe -s -o /dev/null -w "%{http_code}\n" https://<your-host>/api/analysis/combined/0010001   # 401
+curl.exe -s -H "X-API-Key: <your-secret>" https://<your-host>/api/analysis/combined/0010001?requester_user_id=A000001
+```
+
+The connector sends this value as `X-API-Key` (Part 8).
 
 ---
 
@@ -313,6 +479,69 @@ Open the file and check/trim:
   The data survives stop/start on the VM's disk (the named volumes are on disk).
 - **Secrets:** keep `.env` (SA password, `FERNET_KEY`, API key) off git — it's
   already git-ignored. It lives only on the VM.
+
+---
+
+## Appendix A — First real deployment run (what actually happened & the fixes)
+
+The main guide above has been corrected to reflect what we learned; this appendix is
+the chronological account so the reasoning is preserved. Target: one Ubuntu 22.04 VM,
+Docker stack, Sweden Central. Final result: **stack live** — `anima_sqlserver`
+healthy, `anima_seed` exited 0, `anima_api` and `anima_caddy` running.
+
+**1. Region rejections (`RequestDisallowedByAzure`).** `uksouth`, then `ukwest`, then
+`westeurope` all failed at VM-deploy time — the resource group created fine but every
+child resource (VNET/NSG/PublicIP/NIC/VM) was disallowed. Root cause: an
+Azure-for-Students policy, "Allowed resource deployment regions." Diagnosed with
+`az policy assignment list ...`, which returned the allow-list: germanywestcentral,
+swedencentral, italynorth, switzerlandnorth, norwayeast. → **Fix:** deploy only into
+an allowed region (we chose swedencentral). *Also note:* a resource group can't be
+recreated in a new region while it exists, so each region change needed
+`az group delete -n anima-rg --yes` first.
+
+**2. VM size not available (`SkuNotAvailable`).** A separate wall. Within the allowed
+regions, `Standard_B2ms`, `Standard_B1s`, `Standard_B2s`, and `Standard_A2_v2` were
+all capacity-restricted (tried across Sweden Central, Germany West Central, Italy
+North, Norway East, Switzerland North). → **Fix:** `Standard_D2s_v3` in swedencentral
+provisioned first try. FQDN `anima-2526.swedencentral.cloudapp.azure.com`, public IP
+`4.223.102.132`.
+
+**3. `az vm open-port` failed (`ResourceNotFound`).** The shortcut looked for
+`anima-vmNSG`/`anima-vmVMNic` and didn't find them under those names. → **Fix:**
+resolved the real NSG via `az network nsg list -g $RG --query "[0].name" -o tsv`, then
+created `AllowHTTP` (priority 1100) and `AllowHTTPS` (1110) directly. (Priority 1001
+collided with a pre-existing `open-port-80` rule, hence 1100/1110.)
+
+**4. Docker install + code.** `curl -fsSL https://get.docker.com | sudo sh`,
+`usermod -aG docker $USER`, re-login. Docker 29.6.2, Compose v5.3.1. Cloned the repo,
+created `.env`, uploaded data by `scp` from the laptop (all CSVs + the full MRI set).
+
+**5. Build failed: `no space left on device`.** The `docker compose up --build`
+built the images but died while *exporting/unpacking* the API image — specifically on
+the Bio_ClinicalBERT blob — because the default **30 GB** OS disk isn't enough for the
+PyTorch + BERT image. `docker system prune -a --volumes` reclaimed ~13 GB but the
+retry hit the same wall. → **Fix:** grew the OS disk to **64 GB**:
+
+```powershell
+az vm deallocate -g $RG -n $VM
+$DISK = az vm show -g $RG -n $VM --query "storageProfile.osDisk.name" -o tsv
+az disk update -g $RG -n $DISK --size-gb 64
+az vm start -g $RG -n $VM
+```
+
+(For a fresh VM, create it with `--os-disk-size-gb 64` from the start — now baked into
+Part 1 — to skip this entirely.) After the resize, `docker compose ... up -d --build`
+completed and all containers came up.
+
+**Two harmless detours** worth noting so they aren't mistaken for problems: `pytest`
+"command not found" on the VM (the test deps aren't installed in the deployment image
+— tests run in your dev env, not on the server), and `az: command not found` inside
+the SSH session (the Azure CLI runs on your laptop, not the VM). Also, in PowerShell,
+`$HOST` is read-only — use a different variable name (Part 3).
+
+**Net changes folded into this guide:** default region → an allowed one; VM size →
+`Standard_D2s_v3`; OS disk → `--os-disk-size-gb 64`; NSG-rule fallback for open-port;
+`.env` no-spaces note; `$FQDN` instead of `$HOST`; and the new Part 5.5 health checks.
 
 ---
 

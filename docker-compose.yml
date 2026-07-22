@@ -16,7 +16,7 @@ services:
       # Persist database files across container restarts
       - mssql_data:/var/opt/mssql
     healthcheck:
-      # Downstream services wait until SQL Server is actually accepting connections
+      # API waits until SQL Server is actually accepting connections
       test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -C -Q \"SELECT 1\" || exit 1"]
       interval: 10s
       timeout: 5s
@@ -26,17 +26,16 @@ services:
       - anima_net
 
   # ---------------------------------------------------------------------------
-  # One-shot seed: create the schema (db/init_db.sql) + load patients 1-129,
-  # then exit. Idempotent (skips patients already present), so it's safe to
-  # re-run on every `up`. NB: seed_dsm5.py resolves its defaults to /db and
-  # /data, so those folders are bind-mounted below.
+  # Seed - one-shot: create schema + seed admin (init_db.sql) and load the
+  # 1-129 patients, then EXIT. Idempotent (seed_dsm5.py skips existing patients),
+  # so it is safe to run on every `docker compose up`. Runs only after the DB is
+  # healthy; the API waits for this to complete before starting.
   # ---------------------------------------------------------------------------
   seed:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: anima_seed
-    restart: "no"                     # one-shot job - must NOT auto-restart
     depends_on:
       db:
         condition: service_healthy
@@ -47,13 +46,15 @@ services:
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      # Needed to encrypt patient names at rest during the load
       FERNET_KEY: ${FERNET_KEY}
     volumes:
-      - ./app:/app                    # application code (WORKDIR)
-      - ./db:/db:ro                   # init_db.sql (schema) -> /db/init_db.sql
-      - ./data:/data:ro               # seed CSVs           -> /data/*.csv
-      - mri_images:/app/static/mri_images
+      - ./app:/app
+      # seed_dsm5.py resolves its defaults to /data and /db inside the container
+      - ./data:/data
+      - ./db:/db
     command: ["python", "seed_dsm5.py"]
+    restart: "no"
     networks:
       - anima_net
 
@@ -71,9 +72,6 @@ services:
       db:
         # Start the API only once SQL Server reports healthy
         condition: service_healthy
-      seed:
-        # ...and only once the database has been seeded
-        condition: service_completed_successfully
     environment:
       # Database credentials + connection details (from .env)
       DB_HOST: db
@@ -84,6 +82,9 @@ services:
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
       # Symmetric key used by cryptography.fernet for field-level encryption
       FERNET_KEY: ${FERNET_KEY}
+      # Optional shared secret for the Power Apps connector. Leave unset to
+      # disable the X-API-Key gate (the default-blank keeps compose quiet).
+      ANIMA_API_KEY: ${ANIMA_API_KEY:-}
     volumes:
       # Live-mount source for development
       - ./app:/app

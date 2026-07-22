@@ -1,0 +1,8 @@
+# Test-only dependencies. Install these into your venv alongside the app's own
+# requirements.txt (which already provides pandas, nibabel, numpy, pillow,
+# fastapi, cryptography, python-dotenv, pyodbc, torch, transformers, ...).
+#
+#   pip install -r tests/requirements-test.txt
+#
+pytest>=8
+httpx          # required by fastapi.testclient.TestClient (used by the unit tests)
