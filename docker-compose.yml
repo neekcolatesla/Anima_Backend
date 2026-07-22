@@ -26,16 +26,17 @@ services:
       - anima_net
 
   # ---------------------------------------------------------------------------
-  # Seed - one-shot: create schema + seed admin (init_db.sql) and load the
-  # 1-129 patients, then EXIT. Idempotent (seed_dsm5.py skips existing patients),
-  # so it is safe to run on every `docker compose up`. Runs only after the DB is
-  # healthy; the API waits for this to complete before starting.
+  # One-shot seed: create the schema (db/init_db.sql) + load patients 1-129,
+  # then exit. Idempotent (skips patients already present), so it's safe to
+  # re-run on every `up`. NB: seed_dsm5.py resolves its defaults to /db and
+  # /data, so those folders are bind-mounted below.
   # ---------------------------------------------------------------------------
   seed:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: anima_seed
+    restart: "no"                     # one-shot job - must NOT auto-restart
     depends_on:
       db:
         condition: service_healthy
@@ -46,15 +47,13 @@ services:
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
-      # Needed to encrypt patient names at rest during the load
       FERNET_KEY: ${FERNET_KEY}
     volumes:
-      - ./app:/app
-      # seed_dsm5.py resolves its defaults to /data and /db inside the container
-      - ./data:/data
-      - ./db:/db
+      - ./app:/app                    # application code (WORKDIR)
+      - ./db:/db:ro                   # init_db.sql (schema) -> /db/init_db.sql
+      - ./data:/data:ro               # seed CSVs           -> /data/*.csv
+      - mri_images:/app/static/mri_images
     command: ["python", "seed_dsm5.py"]
-    restart: "no"
     networks:
       - anima_net
 
@@ -88,6 +87,9 @@ services:
     volumes:
       # Live-mount source for development
       - ./app:/app
+      # Raw MRI + CSV data, read-only, so seed_mri.py can be run via:
+      #   docker exec anima_api python seed_mri.py --mri-dir /data/mri/<set>
+      - ./data:/data:ro
       # Named volume for processed 2D MRI JPEG slices
       - mri_images:/app/static/mri_images
     networks:

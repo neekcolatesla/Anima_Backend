@@ -1,0 +1,35 @@
+# -----------------------------------------------------------------------------
+# Production overlay
+# -----------------------------------------------------------------------------
+# Adds Caddy (automatic HTTPS via Let's Encrypt) in front of the API and stops
+# the API from publishing 8000 to the host, so ONLY Caddy (80/443) is public.
+# SQL Server (1433) and the API (8000) stay on the private Docker network.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# -----------------------------------------------------------------------------
+services:
+  api:
+    # Don't expose 8000 on the host in production; reach the API only via Caddy.
+    ports: []
+
+  caddy:
+    image: caddy:2
+    container_name: anima_caddy
+    # Auto-restart on crash and come back after a VM stop-start (this is the
+    # only public entrypoint - it must never be left down).
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data          # Caddy's own cert storage (its /data, not the app's)
+      - caddy_config:/config
+    networks:
+      - anima_net
+
+volumes:
+  caddy_data:
+  caddy_config:

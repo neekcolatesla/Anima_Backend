@@ -1,0 +1,8 @@
+# Anima reverse proxy + automatic HTTPS.
+# Caddy fetches and renews a free Let's Encrypt certificate for this exact
+# hostname over ports 80/443, then proxies to the api container on the private
+# Docker network. If you redeploy under a different Azure DNS name, change the
+# hostname on the next line to match (the cert is issued for this literal name).
+anima-2526.swedencentral.cloudapp.azure.com {
+    reverse_proxy api:8000
+}
